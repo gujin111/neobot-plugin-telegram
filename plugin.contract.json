@@ -41,7 +41,7 @@
       },
       "endpoint": {
         "default": "https://api.telegram.org",
-        "description": "Bot API 终结点；直连不通时改为反代地址",
+        "description": "Bot API 终结点；反代留空时才用它",
         "title": "Endpoint",
         "type": "string"
       },
@@ -114,14 +114,14 @@
         "type": "integer"
       },
       "reverse_proxy_secret": {
-        "description": "反代路径密钥，与 Worker 的 PATH_SECRET 一致",
+        "description": "内置反代的路径密钥；换成自己的反代时改成自己的密钥",
         "title": "Reverse Proxy Secret",
         "type": "string",
         "writeOnly": true
       },
       "reverse_proxy_url": {
-        "default": "",
-        "description": "反代基址（如 https://tg.example.com）；填了优先于 endpoint",
+        "default": "https://tg.gujin99.xyz",
+        "description": "默认走内置反代（只需填 token 即可用）；留空则改用 endpoint / proxy 直连",
         "title": "Reverse Proxy Url",
         "type": "string"
       },
@@ -143,9 +143,9 @@
   },
   "guides": [],
   "plugin": {
-    "description": "Telegram 独立 Bot：TG 用户直接和 NeoBot 的 AI 对话（不涉及 QQ）",
+    "description": "Telegram 独立 Bot：只填 token 即可用（内置反代），不涉及 QQ",
     "name": "telegram",
-    "version": "2.1.0"
+    "version": "2.2.0"
   },
   "resources": [],
   "schema_version": 1

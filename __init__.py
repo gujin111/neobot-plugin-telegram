@@ -56,6 +56,12 @@ except ImportError:  # pragma: no cover - 顶层模块加载（pytest 收集 / �
 # ── 配置 ─────────────────────────────────────────────────────────────
 
 
+#: 默认反代：插件作者提供的公共反代，用户只填 token 就能用（无需代理/域名）
+#: 想直连或用自己的反代，把 reverse_proxy_url 清空 / 改成自己的即可
+DEFAULT_REVERSE_PROXY_URL = "https://tg.gujin99.xyz"
+DEFAULT_REVERSE_PROXY_SECRET = "v1-a5e68cb17320"
+
+
 def strip_wrapping_quotes(value: object) -> str:
     """去掉粘贴时带进来的包裹果引号（``"https://…"`` → ``https://…``）。"""
     text = str(value or "").strip()
@@ -93,11 +99,15 @@ class Config(BaseModel):
     # ── 连接 ──
     enabled: bool = Field(default=True, description="总开关；关闭后不连 Telegram（命令仍可用）")
     token: str = Field(default="", description="BotFather 发的机器人令牌：123456:ABC-DEF...")
-    endpoint: str = Field(default=DEFAULT_ENDPOINT, description="Bot API 终结点；直连不通时改为反代地址")
+    endpoint: str = Field(default=DEFAULT_ENDPOINT, description="Bot API 终结点；反代留空时才用它")
     reverse_proxy_url: str = Field(
-        default="", description="反代基址（如 https://tg.example.com）；填了优先于 endpoint"
+        default=DEFAULT_REVERSE_PROXY_URL,
+        description="默认走内置反代（只需填 token 即可用）；留空则改用 endpoint / proxy 直连",
     )
-    reverse_proxy_secret: str = Field(default="", description="反代路径密钥，与 Worker 的 PATH_SECRET 一致")
+    reverse_proxy_secret: str = Field(
+        default=DEFAULT_REVERSE_PROXY_SECRET,
+        description="内置反代的路径密钥；换成自己的反代时改成自己的密钥",
+    )
     proxy: str = Field(
         default="",
         description="网络代理：http://…、socks5://…（内置实现，不需要 socksio），或 auto 自动探测",
@@ -133,8 +143,8 @@ class Config(BaseModel):
 
 
 _PLUGIN_KWARGS: dict[str, Any] = dict(
-    version="2.1.0",
-    description="Telegram 独立 Bot：TG 用户直接和 NeoBot 的 AI 对话（不涉及 QQ）",
+    version="2.2.0",
+    description="Telegram 独立 Bot：只填 token 即可用（内置反代），不涉及 QQ",
     usage="发送 /tg 查看状态；/tg诊断 做一次链路探测",
     author="NeoBot 第三方插件",
     config=Config,

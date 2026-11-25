@@ -1,5 +1,28 @@
 # Changelog
 
+## 2.2.0
+
+**默认走作者的反代**：用户只填 `token` 就能用，不用配代理、也不用买域名。
+
+### 新增
+
+- 配置默认值改为 `reverse_proxy_url = "https://tg.gujin99.xyz"`、`reverse_proxy_secret` 内置，
+  新装只填 `token` 即可连通国内不可直连的环境；
+- 想直连就把 `reverse_proxy_url` 清空（回落到 `endpoint`），想自建就把地址与密钥换成自己的；
+- `/tg状态`、`/tg诊断` 会显示 `来源：反代` 与打码后的地址，便于确认走的是哪条路。
+
+### 说明
+
+- 这是**共享反代**：所有用户的 API 流量都经过作者的 Cloudflare Worker，Worker 只转发
+  `/bot<token>/…` 与 `/file/bot<token>/…`，不记录内容；
+- Worker 不可用时（域名失效、Cloudflare 故障），用户需自行改 `endpoint` 或自己的反代；
+- 后续如需更高隐私，建议自建 Worker（[extras/README.md](extras/README.md)）。
+
+### 验证
+
+pytest **59/59**（新增"默认为反代""清空后回落 endpoint/官方"等解析用例）；
+`devtools/simulate.py` 通过；契约导出 2.2.0。
+
 ## 2.1.0
 
 **彻底去掉 QQ 依赖**：不再借用宿主的 QQ 回复管线，改为直接调用宿主的**主模型服务**

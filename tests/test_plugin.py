@@ -321,22 +321,28 @@ def test_dispatch_answers_callback(scratch):
 
 def test_resolve_endpoint_priority_and_normalization(scratch):
     module, _, _ = make_runtime({"_data_dir": str(scratch)})
+    builtin = f"{module.DEFAULT_REVERSE_PROXY_URL}/{module.DEFAULT_REVERSE_PROXY_SECRET}"
     cases = [
-        ({}, ("https://api.telegram.org", "default")),
-        ({"endpoint": "https://tg.example/"}, ("https://tg.example", "config")),
+        # 默认走内置反代（用户只填 token 就能用）
+        ({}, (builtin, "reverse_proxy")),
+        # 清空反代 → 用 endpoint
+        ({"reverse_proxy_url": "", "endpoint": "https://tg.example/"}, ("https://tg.example", "config")),
+        # 反代与 endpoint 都清空 → 官方直连
+        ({"reverse_proxy_url": "", "endpoint": ""}, ("https://api.telegram.org", "default")),
+        # 自定义反代优先于 endpoint
         (
             {"reverse_proxy_url": "https://w.example/", "reverse_proxy_secret": "/v1-abc/"},
             ("https://w.example/v1-abc", "reverse_proxy"),
         ),
         ({"reverse_proxy_url": "https://w.example", "reverse_proxy_secret": ""}, ("https://w.example", "reverse_proxy")),
         (
-            {"reverse_proxy_url": "https://w.example", "endpoint": "https://ignored.example"},
+            {"reverse_proxy_url": "https://w.example", "reverse_proxy_secret": "", "endpoint": "https://ignored.example"},
             ("https://w.example", "reverse_proxy"),
         ),
-        ({"reverse_proxy_url": '"https://w.example"'}, ("https://w.example", "reverse_proxy")),
-        ({"reverse_proxy_url": '"https://w.example'}, ("https://w.example", "reverse_proxy")),
-        ({"reverse_proxy_url": "w.example"}, ("https://w.example", "reverse_proxy")),
-        ({"endpoint": "tg.example"}, ("https://tg.example", "config")),
+        ({"reverse_proxy_url": '"https://w.example"', "reverse_proxy_secret": ""}, ("https://w.example", "reverse_proxy")),
+        ({"reverse_proxy_url": '"https://w.example', "reverse_proxy_secret": ""}, ("https://w.example", "reverse_proxy")),
+        ({"reverse_proxy_url": "w.example", "reverse_proxy_secret": ""}, ("https://w.example", "reverse_proxy")),
+        ({"reverse_proxy_url": "", "endpoint": "tg.example"}, ("https://tg.example", "config")),
     ]
     for raw, expected in cases:
         assert module._resolve_endpoint(module.Config.model_validate(raw)) == expected, raw

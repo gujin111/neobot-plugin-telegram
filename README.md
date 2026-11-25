@@ -7,6 +7,7 @@ Telegram 用户 → 插件收消息 → 宿主的主模型服务（provider）�
 ```
 
 - 不经过宿主的 QQ 回复管线，不需要 QQ 群/号，不往 QQ 发任何东西
+- **默认走内置反代**（`https://tg.gujin99.xyz`）：新装只需填 `token`，国内也不用配代理/域名
 - 上下文由插件按 **TG 会话**自己维护（内存，默认 12 条）
 - 命令只保留状态查询：`/tg`、`/tg诊断`
 - 目标宿主：NeoBot **v2.1.0a16**（同时验证 2.0.1 / a9 / a7）
@@ -26,19 +27,23 @@ async def chat(messages: list[dict], tools=None) -> dict   # {"role": "assistant
 ## 配置
 
 ```toml
-# 必填
-token = "123456:ABC-DEF..."          # BotFather 给的
+# 只需要这一行：默认已走内置反代，国内无需代理、无需域名
+token = "123456:ABC-DEF..."
 
-# 可选：人格与上下文
+# 以下都可选
 system_prompt = "你是 NeoBot，一个友好的聊天助手。用简短自然的方式回答。"
 history_limit = 12                    # 每个 TG 会话保留几条历史（0 = 无上下文）
 ai_timeout = 120.0                    # 单次模型调用超时（秒）
 ai_error_reply = "（AI 暂时没有响应，请稍后再试）"
+```
 
-# 网络（国内通常必填其一）
-reverse_proxy_url = "https://tg.你的域名"   # 反代，推荐
-reverse_proxy_secret = "v1-xxxxxxxx"        # 与 Worker 的 PATH_SECRET 一致
-proxy = ""                                   # 用反代时留空；也可写 http://… / socks5://… / auto
+内置的反代是这三个默认值（想自己直连或自建反代时改它们）：
+
+```toml
+endpoint = "https://api.telegram.org"        # 反代留空时才用
+reverse_proxy_url = "https://tg.gujin99.xyz" # 清空它 → 走 endpoint / proxy
+reverse_proxy_secret = "v1-a5e68cb17320"     # 换成自己的反代时改成自己的密钥
+proxy = ""                                    # 也可写 http://… / socks5://… / auto
 ```
 
 其余配置项：

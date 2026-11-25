@@ -1,6 +1,6 @@
 name = "telegram"
-version = "2.1.0"
-description = "Telegram 独立 Bot：TG 用户直接和 Neobot 的 AI 对话（不涉及 QQ）"
+version = "2.2.0"
+description = "Telegram 独立 Bot：只填 token 即可用（内置反代），不涉及 QQ"
 author = "NeoBot 第三方插件"
 license = "MIT"
 tags = ["telegram", "im", "chat", "adapter"]
@@ -23,12 +23,13 @@ min_neobot_version = "2.0.0"
 enabled = true
 # BotFather 发的机器人令牌：123456:ABC-DEF...
 token = ""
-# Telegram Bot API 终结点；直连不通时改为反代地址
+# Telegram Bot API 终结点；反代留空时才用它
 endpoint = "https://api.telegram.org"
-# 反代基址（如 https://tg.example.com）；填了它优先于 endpoint
-reverse_proxy_url = ""
-# 反代路径密钥，与 Worker 的 PATH_SECRET 一致；没设就留空
-reverse_proxy_secret = ""
+# 默认走内置反代：用户只填 token 就能用，不需要代理/域名
+# 想直连或用自己的反代，把这一行清空 / 改成自己的地址
+reverse_proxy_url = "https://tg.gujin99.xyz"
+# 内置反代的路径密钥；换成自己的反代时改成自己的
+reverse_proxy_secret = "v1-a5e68cb17320"
 # 网络代理。支持 http://…、socks5://…（内置实现，不需要 socksio），或 auto 自动探测；留空直连
 proxy = ""
 # 通信方式：polling（长轮询，免公网）
