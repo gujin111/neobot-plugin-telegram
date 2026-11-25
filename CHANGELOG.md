@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.1.1
+
+修「容器里解析不了 `host.docker.internal`」这类报错的可操作性。
+
+### 修复
+
+- `proxy = "auto"` 的候选地址补上**容器默认网关**（读 `/proc/net/route`）与 `172.17.0.1`～`172.20.0.1`，
+  并且**只把能解析的 `host.docker.internal` 放进候选**——普通容器里该别名不存在，
+  以前会先撞一次 `getaddrinfo failed`。
+- 连接失败时，若错误文本含 `getaddrinfo`，建议会直接说明：容器里没有该别名，改用
+  `ip route | grep default` 的网关地址、`172.17.0.1`，或直接 `proxy = "auto"`。
+- 建议里的代理地址统一按解析结果展示（原来会把用户写的末尾斜杠原样带出来）。
+
+### 验证
+
+- pytest 71/71（新增：`candidate_hosts` 跳过不可解析别名、`getaddrinfo` 建议文案与地址归一化）。
+- `devtools/simulate.py` 通过；干净副本 `sdk check` 通过；契约导出 1.1.1。
+
 ## 1.1.0
 
 代理能力内置：`socks5://` 不需要再装 `socksio`，`proxy` 还能自己找端口。

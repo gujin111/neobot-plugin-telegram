@@ -459,6 +459,19 @@ def test_connection_hint_covers_direct_proxy_socks_and_endpoint(scratch):
     assert "tg.example" in endpoint and "/bot<token>" in endpoint
 
 
+def test_hint_explains_hostname_resolution_failure(scratch):
+    """容器里没有 host.docker.internal 时，建议要直接给出替代地址。"""
+    module, _, runtime = make_runtime(
+        {"_data_dir": str(scratch), "proxy": "http://host.docker.internal:7890/"}
+    )
+    hint = module._connection_hint(
+        runtime.config, "TelegramTransportError: getaddrinfo failed"
+    )
+    assert "主机名解析失败" in hint
+    assert "172.17.0.1" in hint and "auto" in hint
+    assert "http://host.docker.internal:7890" in hint  # 末尾斜杠已归一化
+
+
 def test_diag_report_probes_connectivity(scratch):
     module, ctx, runtime = make_runtime({"_data_dir": str(scratch), "token": "123456:abc"})
 

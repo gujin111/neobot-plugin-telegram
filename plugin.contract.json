@@ -169,7 +169,7 @@
   "plugin": {
     "description": "Telegram 桥接：移植 Koishi Telegram 适配器（长轮询 + QQ 双向互通）",
     "name": "telegram",
-    "version": "1.1.0"
+    "version": "1.1.1"
   },
   "resources": [],
   "schema_version": 1

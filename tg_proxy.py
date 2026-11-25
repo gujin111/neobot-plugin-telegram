@@ -38,6 +38,44 @@ AUTO_HOSTS = ("127.0.0.1", "host.docker.internal")
 #: 常见代理端口（Clash / mihomo / v2rayN / sing-box / 通用 HTTP 代理）
 AUTO_PORTS = (7890, 7891, 7897, 1080, 10808, 10809, 20171, 3128, 8889)
 
+
+def default_gateway() -> str:
+    """Linux 容器里读 /proc/net/route 取默认网关（Windows / macOS 返回空串）。
+
+    容器里 `host.docker.internal` 常常不存在（只有 Docker Desktop 提供该别名），
+    但默认网关在绝大多数 bridge 网络里就是宿主，因此优先试它。
+    """
+    try:
+        with open("/proc/net/route", encoding="ascii") as handle:
+            next(handle)
+            for line in handle:
+                fields = line.split()
+                if len(fields) < 3 or fields[1] != "00000000":
+                    continue
+                raw = fields[2]
+                return ".".join(str(int(raw[index : index + 2], 16)) for index in (6, 4, 2, 0))
+    except Exception:  # noqa: BLE001 - 非 Linux 或权限问题都按"取不到"处理
+        pass
+    return ""
+
+
+def candidate_hosts() -> list[str]:
+    """按可能性排好序的宿主地址候选（自动跳过解析不了的主机名）。"""
+    hosts: list[str] = ["127.0.0.1"]
+    try:
+        socket.gethostbyname("host.docker.internal")
+        hosts.append("host.docker.internal")
+    except OSError:
+        pass  # 容器里没有这个别名是常态
+    gateway = default_gateway()
+    if gateway and gateway not in hosts:
+        hosts.append(gateway)
+    for index in range(4):
+        host = f"172.{17 + index}.0.1"
+        if host not in hosts:
+            hosts.append(host)
+    return hosts
+
 #: SOCKS5 应答码
 _SOCKS_REPLIES = {
     1: "一般性失败",
@@ -300,15 +338,16 @@ async def _tcp_alive(host: str, port: int, timeout: float = 0.8) -> bool:
 
 async def detect_proxy(
     *,
-    hosts: tuple[str, ...] = AUTO_HOSTS,
+    hosts: tuple[str, ...] | None = None,
     ports: tuple[int, ...] = AUTO_PORTS,
     timeout: float = 0.8,
 ) -> str:
     """``proxy = "auto"`` 用：找出第一个能连上的宿主代理，返回 ``host:port``。
 
     只做 TCP 探测（快，不做真实请求）；找不到返回空串。
+    ``hosts`` 省略时用 :func:`candidate_hosts`（含容器默认网关与 docker 网桥）。
     """
-    for host in hosts:
+    for host in hosts if hosts is not None else tuple(candidate_hosts()):
         for port in ports:
             if await _tcp_alive(host, port, timeout):
                 return f"{host}:{port}"

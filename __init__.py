@@ -132,7 +132,7 @@ class Config(BaseModel):
 
 
 _PLUGIN_KWARGS: dict[str, Any] = dict(
-    version="1.1.0",
+    version="1.1.1",
     description="Telegram 桥接：移植 Koishi Telegram 适配器（长轮询 + QQ 双向互通）",
     usage="发送 @机器人 /tg 查看状态；/tg绑定 建立互通（/help 可查全部命令与别名）",
     author="NeoBot 第三方插件",
@@ -243,7 +243,7 @@ class TelegramRuntime:
             self.state = "error"
             self.last_error = f"{type(exc).__name__}: {exc}"
             self.log("warning", f"Telegram 连接异常：{self.last_error}")
-            self.log("warning", "排查建议：" + _connection_hint(self.config))
+            self.log("warning", "排查建议：" + _connection_hint(self.config, self.last_error))
             self._schedule_watchdog()
 
     async def _resolve_proxy_value(self) -> str:
@@ -639,7 +639,7 @@ class TelegramRuntime:
         ok, detail = await self.api.probe()
         lines.append(f"· 连通性探测：{'通' if ok else '不通'} —— {detail}")
         if not ok:
-            lines.append("· 建议：" + _connection_hint(self.config))
+            lines.append("· 建议：" + _connection_hint(self.config, detail))
         return "\n".join(lines)
 
 
@@ -675,26 +675,34 @@ def _source_label(source: str) -> str:
     return {"reverse_proxy": "反代", "config": "endpoint 配置", "default": "官方默认"}.get(source, source)
 
 
-def _connection_hint(config: Config) -> str:
+def _connection_hint(config: Config, error: str = "") -> str:
     """连接失败时给出可执行的排查建议（覆盖最常见的几种情况）。"""
     endpoint, source = _resolve_endpoint(config)
-    proxy = (config.proxy or "").strip()
+    raw_proxy = (config.proxy or "").strip()
+    lowered = (error or "").lower()
     tips: list[str] = []
-    if (config.proxy or "").strip().lower() == "auto":
+    if raw_proxy.lower() == "auto":
         tips.append(
-            "proxy=auto 只做 TCP 探测：没探到就改成显式地址"
-            "（容器里通常是 http://host.docker.internal:7890）。"
+            "proxy=auto 会依次试 127.0.0.1、host.docker.internal、容器默认网关、172.17.0.1 等地址；"
+            "没探到就改成显式地址。"
         )
-    if proxy:
-        tips.append(
-            f"已配置代理 {proxy}：确认代理进程在运行、端口正确；"
-            "若 NeoBot 跑在容器 / WSL 里，127.0.0.1 指向容器自身，应改用宿主地址。"
-        )
-        if proxy.lower().startswith("socks"):
+    if raw_proxy:
+        try:
+            label = parse_proxy(raw_proxy).label
+        except ProxyUnavailable:
+            label = raw_proxy
+        tips.append(f"已配置代理 {label}：确认代理进程在运行、端口正确。")
+        if raw_proxy.lower().startswith("socks"):
             tips.append(
                 "socks5:// 由插件内置握手（不需要 socksio）：握手失败通常是端口不提供 SOCKS5，"
                 "或账号密码不对（Clash 的 mixed 端口同时支持 HTTP 与 SOCKS5）。"
             )
+    if "getaddrinfo" in lowered:
+        tips.append(
+            "这次报的是「代理主机名解析失败」：容器里通常没有 host.docker.internal 这个别名。"
+            "把 proxy 换成宿主 IP（容器里执行 `ip route | grep default`，取 default via 后面的地址）、"
+            "或 docker 网桥网关（如 172.17.0.1），也可以直接写 proxy = \"auto\" 让插件自己试。"
+        )
     if source == "reverse_proxy":
         tips.append(
             f"已配置反代 {_mask_endpoint(endpoint, config)}：确认 Worker 已部署、"
@@ -706,12 +714,12 @@ def _connection_hint(config: Config) -> str:
             f"已配置 endpoint {endpoint}：确认宿主机能访问它，且它把 "
             "/bot<token>/<method> 与 /file/bot<token>/... 都转发到 api.telegram.org。"
         )
-    elif not proxy:
+    elif not raw_proxy:
         tips.append(
             "当前是直连 api.telegram.org 且未配置代理或反代：国内网络通常无法连通。"
             "可填 reverse_proxy_url（配合 extras/cloudflare-worker.js，无需本地代理），或填 proxy。"
         )
-    else:
+    elif source == "default":
         tips.append("当前用默认 api.telegram.org + 代理：若仍不通，可改用 reverse_proxy_url 走反代。")
     return " ".join(tips)
 

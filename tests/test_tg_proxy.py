@@ -6,10 +6,18 @@
 from __future__ import annotations
 
 import asyncio
+import socket
 
 import pytest
 
-from tg_proxy import ProxyUnavailable, SocksGateway, detect_proxy, parse_proxy, socks5_open
+from tg_proxy import (
+    ProxyUnavailable,
+    SocksGateway,
+    candidate_hosts,
+    detect_proxy,
+    parse_proxy,
+    socks5_open,
+)
 
 
 def run(coro):
@@ -195,6 +203,18 @@ def test_gateway_rejects_non_connect():
 
 
 # ── auto 探测 ──
+
+
+def test_candidate_hosts_skips_unresolvable_alias():
+    hosts = candidate_hosts()
+    assert "127.0.0.1" in hosts
+    assert any(item.startswith("172.") for item in hosts)
+    try:
+        socket.gethostbyname("host.docker.internal")
+        assert "host.docker.internal" in hosts
+    except OSError:
+        # 普通容器里没有这个别名是常态：不该出现在候选里，否则 auto 会先解析失败
+        assert "host.docker.internal" not in hosts
 
 
 def test_detect_proxy_finds_open_port_and_ignores_closed():

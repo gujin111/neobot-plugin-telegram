@@ -1,5 +1,5 @@
 name = "telegram"
-version = "1.1.0"
+version = "1.1.1"
 description = "Telegram 桥接：移植 Koishi Telegram 适配器（长轮询 / Webhook + QQ 互通）"
 author = "NeoBot 第三方插件"
 license = "MIT"
