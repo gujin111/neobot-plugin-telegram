@@ -348,6 +348,14 @@ def test_resolve_endpoint_priority_and_normalization(scratch):
         assert module._resolve_endpoint(module.Config.model_validate(raw)) == expected, raw
 
 
+def test_default_proxy_key_is_builtin_and_masked(scratch):
+    module, _, runtime = make_runtime({"_data_dir": str(scratch), "token": "1:a"})
+    assert runtime.config.proxy_key == module.DEFAULT_PROXY_KEY
+    text = runtime.diag_text()
+    assert "proxy_key：pk-***" in text
+    assert module.DEFAULT_PROXY_KEY not in text
+
+
 def test_config_strips_quotes(scratch):
     module = load_plugin()
     config = module.Config.model_validate(

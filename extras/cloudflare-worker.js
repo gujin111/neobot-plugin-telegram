@@ -1,30 +1,24 @@
 /**
  * Telegram Bot API 反向代理（Cloudflare Worker，免费额度足够个人机器人用）
  *
- * 用途：容器/服务器无法直连 api.telegram.org 时，把插件配置的 endpoint 指向这里，
- * 不需要任何本地代理软件。
+ * 用途：容器/服务器无法直连 api.telegram.org 时，把插件配置的 endpoint 指向这里。
  *
  * 部署（约 2 分钟）：
  *   1. https://dash.cloudflare.com → Workers & Pages → Create → Worker
  *   2. 把本文件内容整体粘进去，Deploy
- *   3. （强烈建议）Settings → Variables and Secrets → 新增 PATH_SECRET，
- *      值填一串随机字符，例如 v1-9f3a7c2e；Deploy 生效
- *   4. 记下地址，按下面的规则填插件配置
+ *   3. Variables and Secrets 里加两个（强烈建议都加）：
+ *        PATH_SECRET = v1-xxxxxxxx    路径密钥（插件里填 reverse_proxy_secret）
+ *        PROXY_KEY   = pk-xxxxxxxx    请求头密钥（插件里填 proxy_key）
+ *   4. 再 Deploy 一次生效
  *
- * 插件配置（plugins_data/telegram/config.toml）：
- *   设了 PATH_SECRET 时：
- *     endpoint = "https://<你的worker域名>/v1-9f3a7c2e"
- *   没设 PATH_SECRET 时：
- *     endpoint = "https://<你的worker域名>"
+ * 鉴权逻辑：
+ *   - 配了 PROXY_KEY：请求必须带 `X-Proxy-Key: <同一个值>`，否则 403；
+ *   - 配了 PATH_SECRET：URL 必须是 `/<PATH_SECRET>/bot<token>/…`，否则 404。
  *
- * 它会转发：
- *   POST /bot<token>/<method>        → https://api.telegram.org/bot<token>/<method>
+ * 只转发：
+ *   POST /bot<token>/<method>         → https://api.telegram.org/bot<token>/<method>
  *   GET  /file/bot<token>/<file_path> → https://api.telegram.org/file/bot<token>/<file_path>
- *
- * 说明：
- *   - 只允许这两类路径，其它一律 404，避免被当成开放代理；
- *   - 不记录、不缓存请求内容（token 在 URL 里，日志里不要打 URL）；
- *   - 请求体原样流式转发，图片/文件上传与下载都能用（单次上限受 Cloudflare 套餐限制）。
+ * 其它路径一律 404，不记录、不缓存请求内容。
  */
 
 export default {
@@ -34,6 +28,13 @@ export default {
       return new Response("method not allowed", { status: 405 });
     }
 
+    // 第一道：请求头密钥（防止别人拿到地址就白蹭）
+    const requiredKey = String(env.PROXY_KEY || "").trim();
+    if (requiredKey && request.headers.get("x-proxy-key") !== requiredKey) {
+      return new Response("forbidden", { status: 403 });
+    }
+
+    // 第二道：路径密钥
     const url = new URL(request.url);
     let path = url.pathname;
     const secret = String(env.PATH_SECRET || "").trim();
@@ -52,8 +53,6 @@ export default {
     const headers = {};
     const contentType = request.headers.get("content-type");
     if (contentType) headers["content-type"] = contentType;
-    const contentLength = request.headers.get("content-length");
-    if (contentLength) headers["content-length"] = contentLength;
 
     const init = { method, headers, redirect: "follow" };
     if (method === "POST") {
@@ -70,10 +69,12 @@ export default {
       });
     }
 
-    const responseHeaders = {
-      "content-type": upstream.headers.get("content-type") || "application/json",
-      "cache-control": "no-store",
-    };
-    return new Response(upstream.body, { status: upstream.status, headers: responseHeaders });
+    return new Response(upstream.body, {
+      status: upstream.status,
+      headers: {
+        "content-type": upstream.headers.get("content-type") || "application/json",
+        "cache-control": "no-store",
+      },
+    });
   },
 };

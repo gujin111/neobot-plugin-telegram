@@ -29,6 +29,17 @@ def run(coro):
     return asyncio.run(coro)
 
 
+def test_custom_headers_are_applied_to_client():
+    async def scenario():
+        api = TelegramAPI(TOKEN, headers={"X-Proxy-Key": "pk-test"})
+        try:
+            assert api.client.headers.get("x-proxy-key") == "pk-test"
+        finally:
+            await api.close()
+
+    run(scenario())
+
+
 def test_token_validation():
     import pytest
 

@@ -42,9 +42,13 @@ ai_error_reply = "（AI 暂时没有响应，请稍后再试）"
 ```toml
 endpoint = "https://api.telegram.org"        # 反代留空时才用
 reverse_proxy_url = "https://tg.gujin99.xyz" # 清空它 → 走 endpoint / proxy
-reverse_proxy_secret = "v1-a5e68cb17320"     # 换成自己的反代时改成自己的密钥
+reverse_proxy_secret = "v1-a5e68cb17320"     # 路径密钥
+proxy_key = "pk-a5e68cb17320"                # 请求头密钥（X-Proxy-Key），不匹配 403
 proxy = ""                                    # 也可写 http://… / socks5://… / auto
 ```
+
+> 内置反代做了两道校验：URL 里的路径密钥 + 请求头 `X-Proxy-Key`。
+> 只拿到地址、没有请求头密钥的请求会被 Worker 直接 403，不会转发到 Telegram。
 
 其余配置项：
 

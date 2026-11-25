@@ -90,9 +90,17 @@ class TelegramRetryAfter(Exception):
         super().__init__(f"Telegram rate limited on {method}, retry after {retry_after}s")
 
 
-def _make_client(proxy: str | None, timeout: float, *, method: str = "client") -> httpx.AsyncClient:
+def _make_client(
+    proxy: str | None,
+    timeout: float,
+    *,
+    method: str = "client",
+    headers: dict[str, str] | None = None,
+) -> httpx.AsyncClient:
     """建 httpx 客户端：兼容 httpx 新旧代理参数，并把 socks 缺依赖翻译成人话。"""
     kwargs: dict[str, Any] = {"timeout": timeout, "follow_redirects": True}
+    if headers:
+        kwargs["headers"] = dict(headers)
     if proxy:
         kwargs["proxy"] = proxy
     try:
@@ -128,6 +136,7 @@ class TelegramAPI:
         client: httpx.AsyncClient | None = None,
         logger: Any | None = None,
         max_retries: int = 3,
+        headers: dict[str, str] | None = None,
     ) -> None:
         if not token or ":" not in token:
             raise ValueError("Telegram token 形如 123456:ABC-DEF，不能为空且必须含 ':'")
@@ -141,6 +150,8 @@ class TelegramAPI:
         self._file_timeout = file_timeout
         self._client = client
         self._owns_client = client is None
+        #: 每次请求都带的头（用于反代的 X-Proxy-Key 校验）
+        self._headers = dict(headers or {})
         self._gateway: SocksGateway | None = None
         self._prepared = False
         self._prepare_lock: asyncio.Lock | None = None
@@ -180,7 +191,9 @@ class TelegramAPI:
                         local=proxy_url,
                     )
             if self._client is None:
-                self._client = _make_client(proxy_url, self._timeout, method="client")
+                self._client = _make_client(
+                    proxy_url, self._timeout, method="client", headers=self._headers
+                )
                 self._owns_client = True
             self._prepared = True
 
@@ -189,7 +202,7 @@ class TelegramAPI:
     @property
     def client(self) -> httpx.AsyncClient:
         if self._client is None:
-            self._client = _make_client(self.proxy, self._timeout, method="client")
+            self._client = _make_client(self.proxy, self._timeout, method="client", headers=self._headers)
         return self._client
 
     async def probe(self, *, timeout: float = 6.0) -> tuple[bool, str]:

@@ -99,6 +99,12 @@
         "title": "Proxy",
         "type": "string"
       },
+      "proxy_key": {
+        "default": "pk-a5e68cb17320",
+        "description": "反代请求头密钥 X-Proxy-Key；与 Worker 的 PROXY_KEY 一致，自建反代时改成自己的",
+        "title": "Proxy Key",
+        "type": "string"
+      },
       "retry_interval": {
         "default": 5.0,
         "description": "断开后的重试间隔（秒）",
@@ -143,9 +149,9 @@
   },
   "guides": [],
   "plugin": {
-    "description": "Telegram 独立 Bot：只填 token 即可用（内置反代），不涉及 QQ",
+    "description": "Telegram 独立 Bot：只填 token 即可用（内置反代 + 请求头校验），不涉及 QQ",
     "name": "telegram",
-    "version": "2.2.0"
+    "version": "2.3.0"
   },
   "resources": [],
   "schema_version": 1

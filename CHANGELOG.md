@@ -1,5 +1,27 @@
 # Changelog
 
+## 2.3.0
+
+给内置反代加**请求头校验**：只拿到地址也用不了。
+
+### 新增
+
+- Worker 侧新增 `PROXY_KEY`：请求必须带 `X-Proxy-Key: <同值>`，否则 403；
+- 插件新增配置 `proxy_key`（默认与内置 Worker 一致），每个 Bot API 请求都会带上该头；
+- `/tg诊断` 显示 `proxy_key：pk-***`（打码），方便确认配置对不对；
+- 与原有的 `PATH_SECRET`（URL 路径密钥）组成两道校验。
+
+### 说明
+
+- 2.2.0 及更早的插件版本**不带这个头**，Worker 一旦开启 `PROXY_KEY` 就会 403 ——
+  升级到 2.3.0 后再给 Worker 加变量（顺序很重要，见 README）；
+- 自建 Worker 时把 `PROXY_KEY` 设成自己的值，并同步填到插件 `proxy_key`。
+
+### 验证
+
+pytest **61/61**（新增"自定义头应用到 httpx 客户端""默认 proxy_key 且诊断打码"）；
+`devtools/simulate.py` 通过；契约导出 2.3.0。
+
 ## 2.2.0
 
 **默认走作者的反代**：用户只填 `token` 就能用，不用配代理、也不用买域名。

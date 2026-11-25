@@ -60,6 +60,15 @@ except ImportError:  # pragma: no cover - 顶层模块加载（pytest 收集 / �
 #: 想直连或用自己的反代，把 reverse_proxy_url 清空 / 改成自己的即可
 DEFAULT_REVERSE_PROXY_URL = "https://tg.gujin99.xyz"
 DEFAULT_REVERSE_PROXY_SECRET = "v1-a5e68cb17320"
+#: 反代请求头密钥：Worker 侧 PROXY_KEY 不匹配就 403，防止地址外泄被白蹭
+DEFAULT_PROXY_KEY = "pk-a5e68cb17320"
+
+
+def _mask_key(value: str) -> str:
+    text = strip_wrapping_quotes(value)
+    if not text:
+        return "未设置"
+    return text if len(text) <= 4 else text[:3] + "***"
 
 
 def strip_wrapping_quotes(value: object) -> str:
@@ -89,6 +98,7 @@ class Config(BaseModel):
         "reverse_proxy_url",
         "reverse_proxy_secret",
         "proxy",
+        "proxy_key",
         "system_prompt",
         mode="before",
     )
@@ -107,6 +117,10 @@ class Config(BaseModel):
     reverse_proxy_secret: str = Field(
         default=DEFAULT_REVERSE_PROXY_SECRET,
         description="内置反代的路径密钥；换成自己的反代时改成自己的密钥",
+    )
+    proxy_key: str = Field(
+        default=DEFAULT_PROXY_KEY,
+        description="反代请求头密钥 X-Proxy-Key；与 Worker 的 PROXY_KEY 一致，自建反代时改成自己的",
     )
     proxy: str = Field(
         default="",
@@ -143,8 +157,8 @@ class Config(BaseModel):
 
 
 _PLUGIN_KWARGS: dict[str, Any] = dict(
-    version="2.2.0",
-    description="Telegram 独立 Bot：只填 token 即可用（内置反代），不涉及 QQ",
+    version="2.3.0",
+    description="Telegram 独立 Bot：只填 token 即可用（内置反代 + 请求头校验），不涉及 QQ",
     usage="发送 /tg 查看状态；/tg诊断 做一次链路探测",
     author="NeoBot 第三方插件",
     config=Config,
@@ -292,6 +306,11 @@ class TelegramRuntime:
                 endpoint=endpoint,
                 proxy=proxy_value or None,
                 logger=self.ctx.logger,
+                headers=(
+                    {"X-Proxy-Key": strip_wrapping_quotes(self.config.proxy_key)}
+                    if strip_wrapping_quotes(self.config.proxy_key)
+                    else None
+                ),
             )
             await self._login()
             await self._start_poller()
@@ -619,6 +638,7 @@ class TelegramRuntime:
             f"· token：{masked}",
             f"· endpoint：{_mask_endpoint(endpoint, self.config)}（来源：{_source_label(source)}）",
             f"· proxy：{self._proxy_line()}",
+            f"· proxy_key：{_mask_key(self.config.proxy_key)}（X-Proxy-Key 请求头）",
             f"· protocol：{self.config.protocol}（当前实际按 polling 运行）",
             f"· 模型服务：{self.ai_provider_label()}；超时={self.config.ai_timeout}s；"
             f"上下文={self.config.history_limit} 条/会话",

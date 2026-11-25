@@ -1,6 +1,6 @@
 name = "telegram"
-version = "2.2.0"
-description = "Telegram 独立 Bot：只填 token 即可用（内置反代），不涉及 QQ"
+version = "2.3.0"
+description = "Telegram 独立 Bot：只填 token 即可用（内置反代 + 请求头校验），不涉及 QQ"
 author = "NeoBot 第三方插件"
 license = "MIT"
 tags = ["telegram", "im", "chat", "adapter"]
@@ -30,6 +30,8 @@ endpoint = "https://api.telegram.org"
 reverse_proxy_url = "https://tg.gujin99.xyz"
 # 内置反代的路径密钥；换成自己的反代时改成自己的
 reverse_proxy_secret = "v1-a5e68cb17320"
+# 反代请求头密钥（X-Proxy-Key）；与 Worker 的 PROXY_KEY 一致，自建时改成自己的
+proxy_key = "pk-a5e68cb17320"
 # 网络代理。支持 http://…、socks5://…（内置实现，不需要 socksio），或 auto 自动探测；留空直连
 proxy = ""
 # 通信方式：polling（长轮询，免公网）
