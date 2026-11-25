@@ -228,7 +228,7 @@ def main() -> int:
     bare.api = FakeAPI()
     asyncio.run(bare.reply_with_ai(module.decode_update(tg_update(23, "hi"))))
     print(f"  回给用户：{bare.api.texts()[-1]!r}")
-    check("提示缺少模型服务", "provider" in bare.api.texts()[-1])
+    check("提示缺少模型服务", "没有可用的模型服务" in bare.api.texts()[-1])
 
     print("\n== /tg状态 ==")
     print("\n".join("  " + line for line in runtime.status_text().splitlines()))
