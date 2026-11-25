@@ -163,7 +163,7 @@ class Config(BaseModel):
 
 
 _PLUGIN_KWARGS: dict[str, Any] = dict(
-    version="3.1.1",
+    version="3.1.2",
     description="Telegram 独立 Bot：只填 token 即可用（内置反代），AI 由宿主模型驱动",
     usage="发送 /tg 查看状态；/tg诊断 做一次链路探测",
     author="NeoBot 第三方插件",
@@ -419,14 +419,41 @@ class TelegramRuntime:
 
     # ── 提示词：沿用宿主的人格与提示词 ──
 
+    def _registries(self) -> list[tuple[str, Any]]:
+        """插件能看到的服务注册表：宿主文档里写的是 ctx.plugin_host.services。"""
+        found: list[tuple[str, Any]] = []
+        host = getattr(self.ctx, "plugin_host", None)
+        registry = getattr(host, "services", None)
+        if registry is not None:
+            found.append(("plugin_host.services", registry))
+        registry = getattr(self.ctx, "services", None)
+        if registry is not None and all(registry is not item for _, item in found):
+            found.append(("ctx.services", registry))
+        return found
+
     def _service(self, name: str) -> Any | None:
-        services = getattr(self.ctx, "services", None)
-        if services is None:
-            return None
-        try:
-            return services.get(name)
-        except Exception:  # noqa: BLE001 - 老宿主没有服务注册表
-            return None
+        for _source, registry in self._registries():
+            try:
+                value = registry.get(name)
+            except Exception:  # noqa: BLE001 - 老宿主/受限注册表
+                continue
+            if value is not None:
+                return value
+        return None
+
+    def service_names(self) -> list[str]:
+        names: list[str] = []
+        for _source, registry in self._registries():
+            try:
+                for name in registry.names():
+                    if name not in names:
+                        names.append(name)
+            except Exception:  # noqa: BLE001
+                continue
+        return names
+
+    def registry_labels(self) -> str:
+        return "、".join(source for source, _ in self._registries()) or "无"
 
     def host_persona(self) -> tuple[str, str]:
         """宿主的（昵称, 人格）——就是面板里写好的那些。"""
@@ -619,7 +646,20 @@ class TelegramRuntime:
             lines.append(f"· 轮询：offset={stats.offset} 收到={stats.received} 失败={stats.failures}")
         if self.provider is None:
             reason = self.provider_error()
-            lines.append("· 模型报错：" + (reason or "宿主未注册 provider / vision_provider；面板「模型」里可能没有可用模型"))
+            lines.append("· 模型报错：" + (reason or "宿主未注册 provider / vision_provider"))
+            lines.append(f"· 服务注册表：{self.registry_labels()}")
+            names = self.service_names()
+            hints = [
+                name
+                for name in names
+                if any(word in name.lower() for word in ("provider", "model", "chat", "llm", "ai"))
+            ]
+            lines.append(
+                "· 模型相关服务：" + ("、".join(hints) if hints else "（没有）")
+                + f"；服务总数={len(names)}"
+            )
+            if not hints and names:
+                lines.append("· 服务名单：" + "、".join(names[:24]) + ("…" if len(names) > 24 else ""))
         return "\n".join(lines)
 
     async def diag_report(self) -> str:

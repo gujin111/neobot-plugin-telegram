@@ -127,7 +127,7 @@
   "plugin": {
     "description": "Telegram 独立 Bot：只填 token 即可用（内置反代），AI 由宿主模型驱动",
     "name": "telegram",
-    "version": "3.1.1"
+    "version": "3.1.2"
   },
   "resources": [],
   "schema_version": 1

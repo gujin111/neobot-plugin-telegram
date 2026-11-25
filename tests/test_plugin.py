@@ -70,15 +70,20 @@ class Services:
     def get(self, name, default=None):
         return self.provided.get(name, default)
 
+    def names(self):
+        return list(self.provided)
+
 
 class Context:
-    def __init__(self, config: dict, *, services: dict | None = None) -> None:
+    def __init__(self, config: dict, *, services: dict | None = None, host_services: dict | None = None) -> None:
         self.config = config
         self.data_dir = pathlib.Path(config.get("_data_dir", "."))
         self.logger = Logger()
         self.app_commands = AppCommands()
         self.adapter = SimpleNamespace(self_id=99999)
         self.services = Services(services)
+        # 宿主文档里的入口：ctx.plugin_host.services
+        self.plugin_host = SimpleNamespace(services=Services(host_services if host_services is not None else services))
 
 
 class FakeAPI:
@@ -143,12 +148,12 @@ class FakePromptStore:
         return self.sections.get(name, default)
 
 
-def make_runtime(config: dict, *, provider=None, services: dict | None = None):
+def make_runtime(config: dict, *, provider=None, services: dict | None = None, host_services: dict | None = None):
     module = load_plugin()
     provided = dict(services or {})
     if provider is not None:
         provided["provider"] = provider
-    ctx = Context(config, services=provided)
+    ctx = Context(config, services=provided, host_services=host_services)
     runtime = module.TelegramRuntime(ctx, module.Config.model_validate(config))
     runtime.api = FakeAPI()
     return module, ctx, runtime
@@ -290,6 +295,28 @@ def test_vision_provider_is_used_as_fallback(scratch):
     asyncio.run(runtime.reply_with_ai(tg_event()))
     assert runtime.api.last_text() == "我是视觉模型，先顶一下"
     assert runtime.counters["replies"] == 1
+
+
+def test_provider_can_come_from_plugin_host_registry(scratch):
+    provider = FakeProvider("来自 host 注册表")
+    module, ctx, runtime = make_runtime(
+        {"_data_dir": str(scratch)}, host_services={"provider": provider, "chat_stream": object()}
+    )
+    assert runtime.provider_source() == "provider"
+    assert "plugin_host.services" in runtime.registry_labels()
+    assert "chat_stream" in runtime.service_names()
+    asyncio.run(runtime.reply_with_ai(tg_event()))
+    assert runtime.api.last_text() == "来自 host 注册表"
+
+
+def test_diag_lists_registries_when_model_missing(scratch):
+    module, ctx, runtime = make_runtime(
+        {"_data_dir": str(scratch), "token": "1:a"}, host_services={"chat_stream": object(), "config": object()}
+    )
+    text = runtime.diag_text()
+    assert "不可用（宿主未注册模型服务）" in text
+    assert "服务注册表：plugin_host.services" in text
+    assert "模型相关服务：chat_stream" in text
 
 
 def test_provider_error_reason_is_surfaced(scratch):
