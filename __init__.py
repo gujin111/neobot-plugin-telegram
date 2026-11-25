@@ -90,6 +90,13 @@ class Config(BaseModel):
     enabled: bool = Field(default=True, description="总开关；关闭后不连 Telegram（命令仍可用）")
     token: str = Field(default="", description="BotFather 发的机器人令牌：123456:ABC-DEF...")
     endpoint: str = Field(default=DEFAULT_ENDPOINT, description="Bot API 终结点；国内直连不通时改为反代地址")
+    reverse_proxy_url: str = Field(
+        default="",
+        description="反代基址（如 https://tg.example.workers.dev）；填了它优先于 endpoint，配合 extras/cloudflare-worker.js",
+    )
+    reverse_proxy_secret: str = Field(
+        default="", description="反代路径密钥，与 Worker 的 PATH_SECRET 一致；Worker 没设密钥时留空"
+    )
     proxy: str = Field(default="", description="网络代理，例如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080")
     protocol: Literal["polling", "webhook"] = Field(
         default="polling", description="通信方式；当前只实现 polling（webhook 需要宿主提供入站 HTTP 端点）"
@@ -119,7 +126,7 @@ class Config(BaseModel):
 
 
 _PLUGIN_KWARGS: dict[str, Any] = dict(
-    version="1.0.1",
+    version="1.0.2",
     description="Telegram 桥接：移植 Koishi Telegram 适配器（长轮询 + QQ 双向互通）",
     usage="发送 @机器人 /tg 查看状态；/tg绑定 建立互通（/help 可查全部命令与别名）",
     author="NeoBot 第三方插件",
@@ -202,16 +209,18 @@ class TelegramRuntime:
                 "当前版本只实现 polling；已按 polling 启动（webhook 需要宿主提供入站 HTTP 端点）",
                 protocol=self.config.protocol,
             )
+        endpoint, source = _resolve_endpoint(self.config)
         self.log(
             "info",
             "正在连接 Telegram",
-            endpoint=(self.config.endpoint or DEFAULT_ENDPOINT),
+            endpoint=_mask_endpoint(endpoint, self.config),
+            source=source,
             proxy=(self.config.proxy or "未配置代理"),
         )
         try:
             self.api = TelegramAPI(
                 token,
-                endpoint=self.config.endpoint or DEFAULT_ENDPOINT,
+                endpoint=endpoint,
                 proxy=self.config.proxy or None,
                 logger=self.ctx.logger,
             )
@@ -532,7 +541,8 @@ class TelegramRuntime:
         lines = ["Telegram 桥接状态"]
         lines.append(f"· 运行状态：{self.state}")
         lines.append(f"· 机器人：@{self.bot_username}" if self.bot_username else "· 机器人：未连接")
-        lines.append(f"· 终结点：{self.config.endpoint or DEFAULT_ENDPOINT}")
+        endpoint, source = _resolve_endpoint(self.config)
+        lines.append(f"· 终结点：{_mask_endpoint(endpoint, self.config)}（来源：{_source_label(source)}）")
         lines.append(f"· 代理：{self.config.proxy or '未设置'}")
         lines.append(f"· 绑定：{len(self.store.bindings)} 条")
         if self.poller is not None:
@@ -548,11 +558,12 @@ class TelegramRuntime:
     def diag_text(self) -> str:
         token = (self.config.token or "").strip()
         masked = f"{token.split(':')[0]}:***" if ":" in token else ("未配置" if not token else "格式异常")
+        endpoint, source = _resolve_endpoint(self.config)
         lines = [
             "Telegram 链路诊断",
             f"· 版本：{plugin.version}（min_neobot_version 2.0.0）",
             f"· token：{masked}",
-            f"· endpoint：{self.config.endpoint or DEFAULT_ENDPOINT}",
+            f"· endpoint：{_mask_endpoint(endpoint, self.config)}（来源：{_source_label(source)}）",
             f"· proxy：{self.config.proxy or '未设置'}",
             f"· protocol：{self.config.protocol}（当前版本实际按 polling 运行）",
             f"· allowed_updates：{len(self.config.allowed_updates) or '默认（含 chat_member）'}",
@@ -594,29 +605,65 @@ class TelegramRuntime:
 _RUNTIME: TelegramRuntime | None = None
 
 
+def _resolve_endpoint(config: Config) -> tuple[str, str]:
+    """算出实际使用的 API 基址，返回 (基址, 来源)。
+
+    优先级：``reverse_proxy_url``（+ ``reverse_proxy_secret``）> ``endpoint`` > 官方地址。
+    反代基址与密钥都会做斜杠归一化，避免拼出 ``//`` 或 ``/secret/bot`` 这类怪路径。
+    """
+    reverse = (config.reverse_proxy_url or "").strip().rstrip("/")
+    if reverse:
+        secret = (config.reverse_proxy_secret or "").strip().strip("/")
+        return (f"{reverse}/{secret}" if secret else reverse), "reverse_proxy"
+    endpoint = (config.endpoint or "").strip().rstrip("/")
+    if endpoint and endpoint != DEFAULT_ENDPOINT.rstrip("/"):
+        return endpoint, "config"
+    return DEFAULT_ENDPOINT.rstrip("/"), "default"
+
+
+def _mask_endpoint(endpoint: str, config: Config) -> str:
+    """把反代密钥从展示用的地址里隐去（日志、诊断都不该出现明文密钥）。"""
+    secret = (config.reverse_proxy_secret or "").strip().strip("/")
+    if secret and secret in endpoint:
+        return endpoint.replace(secret, "***")
+    return endpoint
+
+
+def _source_label(source: str) -> str:
+    return {"reverse_proxy": "反代", "config": "endpoint 配置", "default": "官方默认"}.get(source, source)
+
+
 def _connection_hint(config: Config) -> str:
-    """连接失败时给出可执行的排查建议（覆盖国内网络最常见的三种情况）。"""
-    endpoint = (config.endpoint or DEFAULT_ENDPOINT).rstrip("/")
+    """连接失败时给出可执行的排查建议（覆盖最常见的几种情况）。"""
+    endpoint, source = _resolve_endpoint(config)
     proxy = (config.proxy or "").strip()
+    tips: list[str] = []
     if proxy:
-        hint = (
+        tips.append(
             f"已配置代理 {proxy}：确认代理进程在运行、端口正确；"
-            "若 NeoBot 跑在容器 / WSL 里，127.0.0.1 指向容器自身，应先换成宿主机地址。"
+            "若 NeoBot 跑在容器 / WSL 里，127.0.0.1 指向容器自身，应改用宿主地址。"
         )
         if proxy.lower().startswith("socks"):
-            hint += " socks5:// 需要 socksio（依赖 httpx[socks]），缺依赖会直接连不上。"
-        return hint
-    if endpoint == DEFAULT_ENDPOINT.rstrip("/"):
-        return (
-            "当前是直连 api.telegram.org 且未配置代理：国内网络通常无法连通。"
-            "请在插件配置里填 proxy（例如 http://127.0.0.1:7890），"
-            "或把 endpoint 改成可用的反代地址"
-            "（反代需同时转发 /bot<token>/<method> 与 /file/bot<token>/...）。"
+            tips.append("socks5:// 需要 socksio（依赖 httpx[socks]），缺依赖会直接连不上。")
+    if source == "reverse_proxy":
+        tips.append(
+            f"已配置反代 {_mask_endpoint(endpoint, config)}：确认 Worker 已部署、"
+            "路径密钥与插件填的一致；反代要同时转发 /bot<token>/<method> 与 "
+            "/file/bot<token>/...（extras/cloudflare-worker.js 已经实现）。"
         )
-    return (
-        f"已配置 endpoint {endpoint}：确认宿主机能访问它，且该反代把 "
-        "/bot<token>/<method> 与 /file/bot<token>/... 都转发到 api.telegram.org。"
-    )
+    elif source == "config":
+        tips.append(
+            f"已配置 endpoint {endpoint}：确认宿主机能访问它，且它把 "
+            "/bot<token>/<method> 与 /file/bot<token>/... 都转发到 api.telegram.org。"
+        )
+    elif not proxy:
+        tips.append(
+            "当前是直连 api.telegram.org 且未配置代理或反代：国内网络通常无法连通。"
+            "可填 reverse_proxy_url（配合 extras/cloudflare-worker.js，无需本地代理），或填 proxy。"
+        )
+    else:
+        tips.append("当前用默认 api.telegram.org + 代理：若仍不通，可改用 reverse_proxy_url 走反代。")
+    return " ".join(tips)
 
 
 def _config_of(ctx: Any) -> Config:

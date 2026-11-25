@@ -22,17 +22,21 @@ class Logger:
     def __init__(self) -> None:
         self.lines: list[str] = []
 
+    def _push(self, level: str, message, **fields) -> None:
+        suffix = "".join(f" {key}={value}" for key, value in fields.items())
+        self.lines.append(f"{level} {message}{suffix}")
+
     def info(self, message, **fields):
-        self.lines.append(f"INFO {message}")
+        self._push("INFO", message, **fields)
 
     def warning(self, message, **fields):
-        self.lines.append(f"WARN {message}")
+        self._push("WARN", message, **fields)
 
     def error(self, message, **fields):
-        self.lines.append(f"ERROR {message}")
+        self._push("ERROR", message, **fields)
 
     def debug(self, message, **fields):
-        self.lines.append(f"DEBUG {message}")
+        self._push("DEBUG", message, **fields)
 
     def text(self) -> str:
         return "\n".join(self.lines)
@@ -514,4 +518,47 @@ def test_start_failure_logs_hint_and_schedules_watchdog(scratch):
     assert "Telegram 连接异常" in log
     assert "排查建议" in log and "未配置代理" in log
     assert "endpoint" in log  # 启动日志里打印了实际使用的 endpoint
+
+
+# ── 反代一等配置（1.0.2） ────────────────────────────────────────────
+
+
+def test_resolve_endpoint_priority_and_normalization(scratch):
+    module, _, _ = make_runtime({"_data_dir": str(scratch)})
+    cases = [
+        ({}, ("https://api.telegram.org", "default")),
+        ({"endpoint": "https://tg.example/"}, ("https://tg.example", "config")),
+        (
+            {"reverse_proxy_url": "https://w.example/", "reverse_proxy_secret": "/v1-abc/"},
+            ("https://w.example/v1-abc", "reverse_proxy"),
+        ),
+        ({"reverse_proxy_url": "https://w.example", "reverse_proxy_secret": ""}, ("https://w.example", "reverse_proxy")),
+        (
+            {"reverse_proxy_url": "https://w.example", "endpoint": "https://ignored.example"},
+            ("https://w.example", "reverse_proxy"),
+        ),
+    ]
+    for raw, expected in cases:
+        config = module.Config.model_validate(raw)
+        assert module._resolve_endpoint(config) == expected, raw
+
+
+def test_diag_and_hint_mask_reverse_proxy_secret(scratch):
+    module, _, runtime = make_runtime(
+        {
+            "_data_dir": str(scratch),
+            "reverse_proxy_url": "https://w.example",
+            "reverse_proxy_secret": "v1-secret",
+        }
+    )
+    text = runtime.diag_text()
+    assert "https://w.example/***" in text
+    assert "v1-secret" not in text
+    assert "来源：反代" in text
+
+    hint = module._connection_hint(runtime.config)
+    assert "反代" in hint
+    assert "v1-secret" not in hint
+    assert "/bot<token>" in hint
+
 

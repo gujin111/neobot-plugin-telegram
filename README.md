@@ -79,8 +79,24 @@ ConnectError: All connection attempts failed
 | 情况 | 怎么配 |
 | --- | --- |
 | 有代理软件（Clash / v2ray 等） | `proxy = "http://127.0.0.1:7890"`（端口换成你软件里的 HTTP 端口）；SOCKS5 写 `socks5://127.0.0.1:1080`，依赖 `httpx[socks]`（1.0.1 起默认安装） |
-| NeoBot 跑在容器 / WSL 里 | `127.0.0.1` 指向容器自身，要填宿主机地址（如 `http://host.docker.internal:7890`）或网关 IP |
-| 没有代理 | 自建反代（Cloudflare Worker / Nginx），把 `endpoint` 指向它；反代必须同时转发 `/bot<token>/<method>` 和 `/file/bot<token>/...` |
+| NeoBot 跑在容器 / WSL 里 | `127.0.0.1` 指向容器自身，要填宿主机地址（如 `http://host.docker.internal:7890`）或网关 IP —— 不确定就先在容器里跑 [`extras/find-proxy.py`](extras/find-proxy.py)，它会试出并打印可用地址 |
+| **没有代理 / 不想折腾** | **用插件内置的反代配置**（推荐，见下一节），不需要任何本地代理软件 |
+
+### 反代配置（推荐，无需本地代理）
+
+1. 部署反代：打开 <https://dash.cloudflare.com> → Workers & Pages → Create Worker →
+   粘贴 [`extras/cloudflare-worker.js`](extras/cloudflare-worker.js) → Deploy；
+2. 建议在 Settings → Variables and Secrets 加一个 `PATH_SECRET`（例如 `v1-9f3a7c2e`），再 Deploy；
+3. 插件里只填两行（**不用自己拼 URL**）：
+
+   ```toml
+   reverse_proxy_url = "https://tg.example.workers.dev"
+   reverse_proxy_secret = "v1-9f3a7c2e"     # Worker 没设密钥就留空
+   ```
+
+插件会自动拼成 `https://tg.example.workers.dev/v1-9f3a7c2e/bot<token>/<method>`，
+并把 `/file/bot<token>/...` 一起走反代；密钥在日志与 `/tg诊断` 里一律打码。
+部署细节与 Nginx 备选写法见 [`extras/README.md`](extras/README.md)。
 
 改完保存 → 面板里重载插件（或 `/tg重连`）。1.0.1 起启动失败会每 15 秒自动复检一次，
 连通后自己接上轮询，不用反复重启；`/tg诊断` 会做一次真实 `getMe` 探测，直接告诉你通没通、耗时多少、下一步该改什么。
@@ -109,7 +125,9 @@ ConnectError: All connection attempts failed
 | --- | --- | --- |
 | `enabled` | `true` | 总开关（关掉后不连 Telegram，命令仍可用） |
 | `token` | 空 | BotFather 令牌；空值只打日志、插件待机 |
-| `endpoint` | `https://api.telegram.org` | 反代地址；配合反向代理时改这里 |
+| `endpoint` | `https://api.telegram.org` | 反代地址；与下面的 `reverse_proxy_url` 二选一 |
+| `reverse_proxy_url` | 空 | **反代基址**（如 `https://tg.example.workers.dev`）；填了优先于 `endpoint` |
+| `reverse_proxy_secret` | 空 | 反代路径密钥，与 Worker 的 `PATH_SECRET` 一致；插件自动拼成 `{基址}/{密钥}` |
 | `proxy` | 空 | `http://` / `socks5://` 代理；**国内必需** |
 | `protocol` | `polling` | 当前只实现 `polling`（见已知限制） |
 | `polling_timeout` | `25` | 长轮询等待秒数 |

@@ -143,6 +143,18 @@
         "title": "Retry Times",
         "type": "integer"
       },
+      "reverse_proxy_secret": {
+        "description": "反代路径密钥，与 Worker 的 PATH_SECRET 一致；Worker 没设密钥时留空",
+        "title": "Reverse Proxy Secret",
+        "type": "string",
+        "writeOnly": true
+      },
+      "reverse_proxy_url": {
+        "default": "",
+        "description": "反代基址（如 https://tg.example.workers.dev）；填了它优先于 endpoint，配合 extras/cloudflare-worker.js",
+        "title": "Reverse Proxy Url",
+        "type": "string"
+      },
       "token": {
         "description": "BotFather 发的机器人令牌：123456:ABC-DEF...",
         "title": "Token",
@@ -157,7 +169,7 @@
   "plugin": {
     "description": "Telegram 桥接：移植 Koishi Telegram 适配器（长轮询 + QQ 双向互通）",
     "name": "telegram",
-    "version": "1.0.1"
+    "version": "1.0.2"
   },
   "resources": [],
   "schema_version": 1

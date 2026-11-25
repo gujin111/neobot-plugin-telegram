@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.0.2
+
+把反代做成插件的一等配置，不用再手拼 URL；`extras/` 一并入库。
+
+### 新增
+
+- 配置项 **`reverse_proxy_url` + `reverse_proxy_secret`**：填反代基址与路径密钥即可，
+  插件自动拼成 `{基址}/{密钥}` 并做斜杠归一化，优先级高于 `endpoint`。
+  配合 `extras/cloudflare-worker.js` 使用，容器/服务器里不需要任何本地代理。
+- `extras/`：
+  - `cloudflare-worker.js`：只转发 `/bot<token>/...` 与 `/file/bot<token>/...` 的反代 Worker，
+    支持 `PATH_SECRET` 路径密钥，其它路径一律 404；
+  - `find-proxy.py`：在容器里自动探测宿主代理地址，并真发一次 `getMe` 验证；
+  - `windows-host-proxy.ps1`：Windows 宿主自检（网卡、代理进程、监听地址、防火墙放行）；
+  - `README.md`：三种网络方案的完整操作步骤（含 Nginx 备选）。
+
+### 变更
+
+- 启动日志、`/tg状态`、`/tg诊断` 统一显示**实际使用的 endpoint 与来源**
+  （反代 / endpoint 配置 / 官方默认），反代密钥在日志与诊断里一律打码。
+- 连接失败建议按来源分流：反代 / 自定义 endpoint / 代理 / 直连，各给对应排查项。
+
 ## 1.0.1
 
 修「连不上时不知道该怎么办」，并把启动失败变成可自愈。
