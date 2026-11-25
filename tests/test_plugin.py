@@ -278,8 +278,26 @@ def test_diag_reports_token_shape(scratch):
 def test_missing_provider_hints_user(scratch):
     module, ctx, runtime = make_runtime({"_data_dir": str(scratch)})
     asyncio.run(runtime.reply_with_ai(tg_event()))
-    assert "provider" in runtime.api.last_text()
+    assert "没有可用的模型服务" in runtime.api.last_text()
     assert runtime.counters["failures"] == 1
+
+
+def test_vision_provider_is_used_as_fallback(scratch):
+    vision = FakeProvider("我是视觉模型，先顶一下")
+    module, ctx, runtime = make_runtime({"_data_dir": str(scratch)}, services={"vision_provider": vision})
+    assert runtime.provider_source() == "vision_provider"
+    assert "已回退" in runtime.provider_label()
+    asyncio.run(runtime.reply_with_ai(tg_event()))
+    assert runtime.api.last_text() == "我是视觉模型，先顶一下"
+    assert runtime.counters["replies"] == 1
+
+
+def test_provider_error_reason_is_surfaced(scratch):
+    orchestrator = SimpleNamespace(_provider_error_message="主模型密钥无效，已停用")
+    module, ctx, runtime = make_runtime({"_data_dir": str(scratch)}, services={"reply_orchestrator": orchestrator})
+    asyncio.run(runtime.reply_with_ai(tg_event()))
+    assert "主模型密钥无效，已停用" in runtime.api.last_text()
+    assert "主模型密钥无效，已停用" in runtime.diag_text()
 
 
 def test_provider_error_sends_error_reply(scratch):

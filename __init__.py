@@ -163,7 +163,7 @@ class Config(BaseModel):
 
 
 _PLUGIN_KWARGS: dict[str, Any] = dict(
-    version="3.1.0",
+    version="3.1.1",
     description="Telegram 独立 Bot：只填 token 即可用（内置反代），AI 由宿主模型驱动",
     usage="发送 /tg 查看状态；/tg诊断 做一次链路探测",
     author="NeoBot 第三方插件",
@@ -389,17 +389,33 @@ class TelegramRuntime:
 
     @property
     def provider(self) -> Any | None:
-        """宿主的主模型服务（neobot_chat 的 Provider）。"""
-        services = getattr(self.ctx, "services", None)
-        if services is None:
-            return None
-        try:
-            return services.get("provider")
-        except Exception:  # noqa: BLE001 - 老宿主没有服务注册表
-            return None
+        """宿主的模型服务：主模型不可用时回退到视觉模型（与宿主自身行为一致）。"""
+        for name in ("provider", "vision_provider"):
+            service = self._service(name)
+            if service is not None:
+                return service
+        return None
+
+    def provider_source(self) -> str:
+        for name in ("provider", "vision_provider"):
+            if self._service(name) is not None:
+                return name
+        return ""
+
+    def provider_error(self) -> str:
+        """宿主记录的模型失败原因（面板也会显示同一条）。"""
+        orchestrator = self._service("reply_orchestrator")
+        if orchestrator is None:
+            return ""
+        return str(getattr(orchestrator, "_provider_error_message", "") or "").strip()
 
     def provider_label(self) -> str:
-        return "宿主 provider（可用）" if self.provider is not None else "宿主 provider（不可用）"
+        source = self.provider_source()
+        if source == "provider":
+            return "宿主 provider（可用）"
+        if source == "vision_provider":
+            return "宿主 vision_provider（主模型不可用，已回退）"
+        return "不可用（宿主未注册模型服务）"
 
     # ── 提示词：沿用宿主的人格与提示词 ──
 
@@ -463,9 +479,12 @@ class TelegramRuntime:
     async def reply_with_ai(self, event: IncomingEvent) -> None:
         if self.provider is None:
             self.counters["failures"] += 1
+            reason = self.provider_error()
+            detail = f"：{reason}" if reason else ""
             await self._safe_send(
                 event.chat_id,
-                "宿主没有可用的模型服务（provider），暂时无法回复；请先在 NeoBot 面板里配置模型",
+                f"NeoBot 现在没有可用的模型服务{detail}。\n"
+                "请在面板「模型」里配好可用的主模型（或视觉模型），保存后重载插件。",
                 reply_to=event.message_id,
             )
             return
@@ -598,6 +617,9 @@ class TelegramRuntime:
         if self.poller is not None:
             stats = self.poller.stats
             lines.append(f"· 轮询：offset={stats.offset} 收到={stats.received} 失败={stats.failures}")
+        if self.provider is None:
+            reason = self.provider_error()
+            lines.append("· 模型报错：" + (reason or "宿主未注册 provider / vision_provider；面板「模型」里可能没有可用模型"))
         return "\n".join(lines)
 
     async def diag_report(self) -> str:
