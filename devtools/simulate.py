@@ -95,6 +95,26 @@ class Services:
         return self.provided.get(name, default)
 
 
+class FakeHostConfig:
+    """冒充宿主的 config 服务：面板里写的昵称与人格。"""
+
+    bot_nick_name = "小九"
+
+    def __init__(self) -> None:
+        self.bot = SimpleNamespace(bot_data="我是一个喜欢聊天、说话简短的猫娘。")
+
+
+class FakePromptStore:
+    def __init__(self) -> None:
+        self.sections = {"gentle_language": "<温和发言>不喜欢吵架，有人吵架就劝架。</温和发言>"}
+
+    def enabled(self, name):
+        return True
+
+    def get(self, name, sub="template", default=""):
+        return self.sections.get(name, default)
+
+
 class Context:
     def __init__(self, data_dir: pathlib.Path, provider=None) -> None:
         self.data_dir = data_dir
@@ -102,7 +122,10 @@ class Context:
         self.logger = Logger()
         self.app_commands = AppCommands()
         self.adapter = SimpleNamespace(self_id=99999)
-        self.services = Services({"provider": provider} if provider else {})
+        provided = {"config": FakeHostConfig(), "prompt_store": FakePromptStore()}
+        if provider:
+            provided["provider"] = provider
+        self.services = Services(provided)
 
 
 class FakeAPI:
@@ -158,7 +181,8 @@ def main() -> int:
     provider = FakeProvider("我是 NeoBot，很高兴在 Telegram 见到你。")
     config = {
         "token": "123456:SIMULATED",
-        "system_prompt": "你是 NeoBot，回答简短。",
+        "host_prompt_sections": ["gentle_language"],
+        "system_prompt": "回答尽量短，一两句就好。",
         "history_limit": 6,
     }
     ctx = Context(workdir, provider=provider)
@@ -181,9 +205,13 @@ def main() -> int:
     check("调用了宿主模型服务", len(provider.calls) == 1)
     if provider.calls:
         messages = provider.calls[0]
-        print(f"  system：{messages[0]['content']!r}")
+        print("  system：")
+        for line in messages[0]["content"].splitlines():
+            print(f"      {line}")
         print(f"  user  ：{messages[-1]['content']!r}")
-        check("system_prompt 已带上", messages[0]["role"] == "system")
+        check("沿用宿主人格", "猫娘" in messages[0]["content"])
+        check("拼接了指定分区", "劝架" in messages[0]["content"])
+        check("补上了 TG 对话规则", "不要调用任何工具" in messages[0]["content"])
     sent = runtime.api.texts()
     print(f"  回给 Telegram：{sent[-1]!r}" if sent else "  没有发送")
     check("模型文本回传到 TG", bool(sent) and "我是 NeoBot" in sent[-1])

@@ -37,6 +37,14 @@
         "title": "History Limit",
         "type": "integer"
       },
+      "host_prompt_sections": {
+        "description": "额外拼接的宿主提示词分区名（prompts.toml 的段名），例如 [\"gentle_language\", \"human_feel\"]；留空则只用昵称与人格",
+        "items": {
+          "type": "string"
+        },
+        "title": "Host Prompt Sections",
+        "type": "array"
+      },
       "ignore_telegram_bots": {
         "default": true,
         "description": "忽略其它机器人发的消息",
@@ -50,6 +58,16 @@
         "minimum": 1,
         "title": "Polling Timeout",
         "type": "integer"
+      },
+      "prompt_source": {
+        "default": "host",
+        "description": "host = 沿用 NeoBot 的昵称与人格（面板里写的），并追加下面的补充提示词；custom = 只用下面的 system_prompt",
+        "enum": [
+          "host",
+          "custom"
+        ],
+        "title": "Prompt Source",
+        "type": "string"
       },
       "proxy": {
         "default": "",
@@ -90,8 +108,8 @@
         "type": "string"
       },
       "system_prompt": {
-        "default": "你是 NeoBot，一个友好的聊天助手。用简短自然的方式回答。",
-        "description": "系统提示词（人格）",
+        "default": "",
+        "description": "补充提示词；prompt_source=custom 时它就是全部（留空则没有任何人格）",
         "title": "System Prompt",
         "type": "string"
       },
@@ -109,7 +127,7 @@
   "plugin": {
     "description": "Telegram 独立 Bot：只填 token 即可用（内置反代），AI 由宿主模型驱动",
     "name": "telegram",
-    "version": "3.0.1"
+    "version": "3.1.0"
   },
   "resources": [],
   "schema_version": 1

@@ -18,7 +18,7 @@ import asyncio
 import contextlib
 import re
 import time
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -54,6 +54,16 @@ DEFAULT_PROXY_KEY = "pk-a5e68cb17320"
 
 #: 单条消息的字数上限（按段落切分，留出安全余量）
 CHUNK_SIZE = 3500
+
+#: 直接输出正文的对话规则：TG 这条链路没有工具，必须说清楚
+_TG_RULES = (
+    "<对话方式>\n"
+    "你现在通过 Telegram 和用户对话。直接输出你要说的那句话即可：\n"
+    "- 不要调用任何工具，也不要写 send_reply / cancel 之类的名字；\n"
+    "- 不要输出思考过程、草稿、计划，也不要带消息编号或 [msg_id=...] 之类前缀；\n"
+    "- 像真人聊天一样简短、口语化；不确定的事直说，不要编。\n"
+    "</对话方式>"
+)
 
 
 def strip_wrapping_quotes(value: object) -> str:
@@ -132,8 +142,18 @@ class Config(BaseModel):
     ignore_telegram_bots: bool = Field(default=True, description="忽略其它机器人发的消息")
 
     # AI
+    prompt_source: Literal["host", "custom"] = Field(
+        default="host",
+        description="host = 沿用 NeoBot 的昵称与人格（面板里写的），并追加下面的补充提示词；"
+        "custom = 只用下面的 system_prompt",
+    )
     system_prompt: str = Field(
-        default="你是 NeoBot，一个友好的聊天助手。用简短自然的方式回答。", description="系统提示词（人格）"
+        default="", description="补充提示词；prompt_source=custom 时它就是全部（留空则没有任何人格）"
+    )
+    host_prompt_sections: list[str] = Field(
+        default_factory=list,
+        description="额外拼接的宿主提示词分区名（prompts.toml 的段名），例如 "
+        '["gentle_language", "human_feel"]；留空则只用昵称与人格',
     )
     history_limit: int = Field(default=12, ge=0, le=100, description="每个 TG 会话保留的历史条数（0 = 无上下文）")
     ai_timeout: float = Field(default=120.0, ge=5.0, description="单次模型调用超时（秒）")
@@ -143,7 +163,7 @@ class Config(BaseModel):
 
 
 _PLUGIN_KWARGS: dict[str, Any] = dict(
-    version="3.0.1",
+    version="3.1.0",
     description="Telegram 独立 Bot：只填 token 即可用（内置反代），AI 由宿主模型驱动",
     usage="发送 /tg 查看状态；/tg诊断 做一次链路探测",
     author="NeoBot 第三方插件",
@@ -381,6 +401,62 @@ class TelegramRuntime:
     def provider_label(self) -> str:
         return "宿主 provider（可用）" if self.provider is not None else "宿主 provider（不可用）"
 
+    # ── 提示词：沿用宿主的人格与提示词 ──
+
+    def _service(self, name: str) -> Any | None:
+        services = getattr(self.ctx, "services", None)
+        if services is None:
+            return None
+        try:
+            return services.get(name)
+        except Exception:  # noqa: BLE001 - 老宿主没有服务注册表
+            return None
+
+    def host_persona(self) -> tuple[str, str]:
+        """宿主的（昵称, 人格）——就是面板里写好的那些。"""
+        config = self._service("config")
+        if config is None:
+            return "", ""
+        nick = ""
+        with contextlib.suppress(Exception):
+            nick = str(getattr(config, "bot_nick_name", "") or "").strip()
+        persona = ""
+        with contextlib.suppress(Exception):
+            persona = str(getattr(getattr(config, "bot", None), "bot_data", "") or "").strip()
+        return nick, persona
+
+    def host_section(self, name: str) -> str:
+        """读宿主 prompts.toml 的某个分区（用户可自行改写的提示词）。"""
+        store = self._service("prompt_store")
+        if store is None or not name:
+            return ""
+        text = ""
+        with contextlib.suppress(Exception):
+            if hasattr(store, "enabled") and not store.enabled(name):
+                return ""
+            text = str(store.get(name, "template", "") or "").strip()
+        return text
+
+    def build_system_prompt(self) -> str:
+        """host 模式：宿主昵称 + 人格 + 指定分区 + 补充提示词 + TG 对话规则。"""
+        parts: list[str] = []
+        if self.config.prompt_source == "host":
+            nick, persona = self.host_persona()
+            body = f"你的名字是{nick}。\n{persona}".strip() if nick else persona
+            if body:
+                parts.append(f"<你是谁>\n{body}\n</你是谁>")
+            for section in self.config.host_prompt_sections:
+                text = self.host_section(section)
+                if text:
+                    parts.append(text)
+        extra = self.config.system_prompt.strip()
+        if extra:
+            parts.append(extra)
+        if self.config.prompt_source == "custom" and not parts:
+            return ""
+        parts.append(_TG_RULES)
+        return "\n\n".join(parts)
+
     def history_for(self, chat_id: str) -> list[dict[str, Any]]:
         return self._history.setdefault(str(chat_id), [])
 
@@ -411,8 +487,9 @@ class TelegramRuntime:
             return ""
         history = self.history_for(chat_id)
         messages: list[dict[str, Any]] = []
-        if self.config.system_prompt.strip():
-            messages.append({"role": "system", "content": self.config.system_prompt})
+        system = self.build_system_prompt()
+        if system:
+            messages.append({"role": "system", "content": system})
         messages.extend(history)
         messages.append({"role": "user", "content": user_text})
         try:
@@ -476,6 +553,19 @@ class TelegramRuntime:
         proxy = strip_wrapping_quotes(self.config.proxy)
         return proxy or "未设置（走反代或直连）"
 
+    def _prompt_summary(self) -> str:
+        nick, persona = self.host_persona()
+        if self.config.prompt_source == "custom":
+            return f"custom（只用 system_prompt，{len(self.config.system_prompt)} 字）"
+        detail = f"宿主人格 {len(persona)} 字"
+        if nick:
+            detail += f"、昵称 {nick}"
+        if self.config.system_prompt.strip():
+            detail += f"、补充 {len(self.config.system_prompt)} 字"
+        if self.config.host_prompt_sections:
+            detail += "、分区 " + "/".join(self.config.host_prompt_sections)
+        return f"host（{detail}）；上下文 {self.config.history_limit} 条/会话"
+
     def status_text(self) -> str:
         endpoint, source = _resolve_endpoint(self.config)
         lines = [
@@ -503,7 +593,7 @@ class TelegramRuntime:
             f"· 代理：{self._proxy_line()}",
             f"· proxy_key：{mask(self.config.proxy_key)}（X-Proxy-Key 请求头）",
             f"· 模型服务：{self.provider_label()}；超时={self.config.ai_timeout}s",
-            f"· 上下文：{self.config.history_limit} 条/会话；system_prompt {len(self.config.system_prompt)} 字",
+            f"· 提示词：{self._prompt_summary()}",
         ]
         if self.poller is not None:
             stats = self.poller.stats

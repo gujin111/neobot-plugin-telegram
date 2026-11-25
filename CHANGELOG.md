@@ -1,5 +1,30 @@
 # Changelog
 
+## 3.1.0
+
+**默认沿用 NeoBot 的模型与提示词**：不再让插件自带一句写死的"你是 NeoBot…"。
+
+### 新增
+
+- `prompt_source`（默认 `host`）：系统提示词 = 宿主昵称 + **人格（`bot.bot_data`，就是面板里写的）**
+  + `host_prompt_sections` 指定的 `prompts.toml` 分区 + 补充 `system_prompt` + TG 对话规则；
+- `host_prompt_sections`：可拼接宿主任意提示词分区（如 `gentle_language`、`human_feel`），
+  用的是 `prompt_store` 服务，所以你改过 `prompts.toml` 也会跟着生效；
+- `system_prompt` 默认值改为空：`host` 模式下它是"补充"，`custom` 模式下才是全部；
+  设成 `custom` 且留空时不发 system 消息（完全裸模型）；
+- `/tg诊断` 新增 `· 提示词：host（宿主人格 N 字、昵称 X；上下文 M 条/会话）`。
+
+### 说明
+
+- 模型一直是宿主的 `provider`（面板里配的那个），这次只是把**人格与提示词**也接了过来；
+- 刻意**不**拼接 QQ 专用内容（`send_reply`/`cancel`、@ 规则、群档案等）——
+  TG 这条链路没有工具，所以补上 `<对话方式>`：直接输出正文、不要调工具、不要带消息编号前缀。
+
+### 验证
+
+pytest **54/54**（新增：宿主人格拼接、分区拼接、custom 模式、空 custom 不发 system、
+无服务时兜底、诊断显示提示词来源）；`devtools/simulate.py` 通过（会打印完整的 system 提示词）。
+
 ## 3.0.1
 
 把"连不上"的原因直接写进日志和诊断，不用再靠猜。

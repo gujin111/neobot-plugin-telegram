@@ -1,5 +1,5 @@
 name = "telegram"
-version = "3.0.1"
+version = "3.1.0"
 description = "Telegram 独立 Bot：只填 token 即可用（内置反代），AI 由宿主模型驱动"
 author = "NeoBot 第三方插件"
 license = "MIT"
@@ -44,9 +44,14 @@ retry_interval = 5.0
 # 忽略其它机器人发的消息
 ignore_telegram_bots = true
 
-# ── AI：直接调用宿主的主模型服务（Provider），全程不涉及 QQ ──
-# 系统提示词（人格设定）
-system_prompt = "你是 NeoBot，一个友好的聊天助手。用简短自然的方式回答。"
+# ── AI：直接用宿主的主模型服务（Provider）与宿主已写好的人格/提示词 ──
+# host = 沿用 NeoBot 面板里的昵称与人格（bot_data），并追加下面的补充提示词
+# custom = 只用下面的 system_prompt
+prompt_source = "host"
+# 补充提示词；prompt_source=custom 时它就是全部（留空则没有系统提示词）
+system_prompt = ""
+# 额外拼接的宿主提示词分区（prompts.toml 段名），例如 ["gentle_language", "human_feel"]
+host_prompt_sections = []
 # 每个 TG 会话保留的历史消息条数（0 = 无上下文）
 history_limit = 12
 # 单次模型调用超时（秒）

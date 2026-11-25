@@ -122,10 +122,33 @@ class FakeProvider:
         return {"role": "assistant", "content": self.reply}
 
 
-def make_runtime(config: dict, *, provider=None):
+class FakeHostConfig:
+    """冒充宿主的 config 服务（ConfigProxy）：昵称 + 人格。"""
+
+    def __init__(self, nick: str = "小九", persona: str = "我是一个喜欢聊天的猫娘。") -> None:
+        self.bot_nick_name = nick
+        self.bot = SimpleNamespace(bot_data=persona)
+
+
+class FakePromptStore:
+    """冒充宿主的 prompt_store 服务。"""
+
+    def __init__(self, sections: dict | None = None) -> None:
+        self.sections = dict(sections or {})
+
+    def enabled(self, name: str) -> bool:
+        return True
+
+    def get(self, name: str, sub: str = "template", default: str = "") -> str:
+        return self.sections.get(name, default)
+
+
+def make_runtime(config: dict, *, provider=None, services: dict | None = None):
     module = load_plugin()
-    services = {"provider": provider} if provider is not None else {}
-    ctx = Context(config, services=services)
+    provided = dict(services or {})
+    if provider is not None:
+        provided["provider"] = provider
+    ctx = Context(config, services=provided)
     runtime = module.TelegramRuntime(ctx, module.Config.model_validate(config))
     runtime.api = FakeAPI()
     return module, ctx, runtime
@@ -304,6 +327,69 @@ def test_body_uses_media_placeholder_when_no_text(scratch):
     empty = tg_event(text="")
     empty.media = ["photo"]
     assert empty.body == "[photo]"
+
+
+# ── 提示词：默认沿用宿主 ────────────────────────────────────────────
+
+
+def test_host_prompt_uses_persona_and_tg_rules(scratch):
+    services = {
+        "config": FakeHostConfig(),
+        "prompt_store": FakePromptStore({"gentle_language": "<温和发言>别吵架</温和发言>"}),
+    }
+    provider = FakeProvider()
+    module, ctx, runtime = make_runtime(
+        {"_data_dir": str(scratch), "host_prompt_sections": ["gentle_language"]},
+        provider=provider,
+        services=services,
+    )
+    prompt = runtime.build_system_prompt()
+    assert "你的名字是小九" in prompt
+    assert "猫娘" in prompt
+    assert "别吵架" in prompt
+    assert "不要调用任何工具" in prompt
+    asyncio.run(runtime.reply_with_ai(tg_event()))
+    assert provider.calls[0][0]["role"] == "system"
+    assert "猫娘" in provider.calls[0][0]["content"]
+
+
+def test_prompt_source_custom_ignores_host_persona(scratch):
+    module, ctx, runtime = make_runtime(
+        {"_data_dir": str(scratch), "prompt_source": "custom", "system_prompt": "你是测试助手。"},
+        services={"config": FakeHostConfig()},
+    )
+    prompt = runtime.build_system_prompt()
+    assert "你是测试助手。" in prompt
+    assert "猫娘" not in prompt
+
+
+def test_empty_custom_prompt_sends_no_system_message(scratch):
+    provider = FakeProvider()
+    module, ctx, runtime = make_runtime(
+        {"_data_dir": str(scratch), "prompt_source": "custom", "system_prompt": ""},
+        provider=provider,
+        services={"config": FakeHostConfig()},
+    )
+    assert runtime.build_system_prompt() == ""
+    asyncio.run(runtime.reply_with_ai(tg_event()))
+    assert provider.calls[0][0]["role"] == "user"
+
+
+def test_host_prompt_falls_back_without_services(scratch):
+    module, ctx, runtime = make_runtime({"_data_dir": str(scratch), "system_prompt": "补充说明"})
+    prompt = runtime.build_system_prompt()
+    assert "补充说明" in prompt
+    assert "不要调用任何工具" in prompt
+    assert runtime.host_persona() == ("", "")
+
+
+def test_diag_reports_prompt_source(scratch):
+    module, ctx, runtime = make_runtime(
+        {"_data_dir": str(scratch), "token": "1:a"}, services={"config": FakeHostConfig()}
+    )
+    text = runtime.diag_text()
+    assert "提示词：host" in text
+    assert "宿主人格" in text and "小九" in text
 
 
 # ── 入站分发 ───────────────────────────────────────────────────────

@@ -32,8 +32,21 @@ Telegram 用户 → 插件收消息 → 宿主的主模型服务（provider）�
 async def chat(messages: list[dict], tools=None) -> dict   # {"role": "assistant", "content": "..."}
 ```
 
-插件做的事就是：`system_prompt` + 该 TG 会话的历史 + 当前消息 → `provider.chat(...)` → 把 `content` 发回 TG。
-所以**模型用的是你在 NeoBot 里配的那个**，不用另填 API Key。
+插件做的事就是：**系统提示词** + 该 TG 会话的历史 + 当前消息 → `provider.chat(...)` → 把 `content` 发回 TG。
+
+系统提示词默认**沿用你在 NeoBot 里已经写好的东西**（`prompt_source = "host"`）：
+
+```
+<你是谁>                     ← 宿主昵称（bot_nick_name）+ 人格（bot.bot_data）
+  你的名字是小九。
+  我是一个喜欢聊天的猫娘。
+</你是谁>
+…（host_prompt_sections 里指定的 prompts.toml 分区，可选）
+…（system_prompt 补充提示词，可选）
+<对话方式>                    ← 插件补的 TG 规则：直接输出正文、不要调工具
+```
+
+模型也是面板里配的那个，不用另填 API Key。
 
 ## 配置
 
@@ -42,7 +55,9 @@ async def chat(messages: list[dict], tools=None) -> dict   # {"role": "assistant
 token = "123456:ABC-DEF..."
 
 # 以下都可选
-system_prompt = "你是 NeoBot，一个友好的聊天助手。用简短自然的方式回答。"
+system_prompt = ""                    # 补充提示词（host 模式下追加；custom 模式下就是全部）
+prompt_source = "host"                 # host = 沿用宿主昵称/人格；custom = 只用 system_prompt
+host_prompt_sections = []              # 额外拼接的 prompts.toml 分区，如 ["gentle_language"]
 history_limit = 12                    # 每个 TG 会话保留几条历史（0 = 无上下文）
 ai_timeout = 120.0                    # 单次模型调用超时（秒）
 ai_error_reply = "（AI 暂时没有响应，请稍后再试）"
@@ -73,6 +88,12 @@ proxy = ""                                    # 也可写 http://127.0.0.1:7890�
 | `allowed_updates` | 空=全部 | 留空即包含 `chat_member` |
 | `parse_mode` / `link_preview` / `chunk_size` | html / true / 3500 | 出站渲染 |
 | `ignore_telegram_bots` | `true` | 忽略其它机器人 |
+| `prompt_source` | `host` | `host` = 沿用宿主昵称/人格；`custom` = 只用 `system_prompt` |
+| `system_prompt` | 空 | 补充提示词；`custom` 模式下是全部 |
+| `host_prompt_sections` | `[]` | 额外拼接的 `prompts.toml` 分区名 |
+| `history_limit` | `12` | 每个 TG 会话保留的历史条数（0 = 无上下文） |
+| `ai_timeout` | `120` | 单次模型调用超时（秒） |
+| `ai_error_reply` | `（AI 暂时没有响应…）` | 模型失败时的兜底文案，留空则不回复 |
 
 ## 命令（只有两条）
 
@@ -137,7 +158,7 @@ python -m neobot_modloader.sdk check .   # 2.1.0a15+ 才有
 
 ## 已知限制
 
-1. **不带宿主的工具/技能/人格/记忆**：只借用模型本身，`system_prompt` 由你写；
+1. **不带宿主的工具/技能/记忆**：人格与昵称沿用宿主（`prompt_source = "host"`），但没有工具、记忆与 QQ 侧的一切；
 2. **上下文在内存里**：重启即清空，且每个 TG 会话（私聊按用户、群聊按群）一份；
 3. 群聊里所有成员共用同一个上下文；
 4. 同一会话串行处理（插件加锁），模型慢时会排队；
