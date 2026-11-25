@@ -1,0 +1,52 @@
+# Changelog
+
+## 1.0.0
+
+首个版本：把 Koishi 的 `@koishijs/plugin-adapter-telegram`（`@satorijs/adapter-telegram` 4.5.x）
+以 NeoBot 插件形态移植，并补上 Koishi 侧缺失的能力。
+
+### 新增
+
+- **Telegram Bot API 客户端**（`tg_api.py`）：endpoint / 代理 / 超时、业务错误包装
+  （`Telegram API error <code>. <description>`，与 Koishi `SenderError` 同款文案）、
+  网络与 5xx 指数退避、**429 读 `parameters.retry_after` 精确退避**、`getMe` / `getUpdates` /
+  `setWebhook` / `deleteWebhook` / `getFile`、文件下载、multipart 上传。
+- **长轮询**（`TelegramPoller`）：自动摘除已有 webhook、`timeout=0` 探活对齐 offset、
+  初次连接失败超过 `retry_times` 转离线、之后按 `retry_interval` 继续重试；**显式带上
+  `allowed_updates`（含 `chat_member`）**，修掉 Koishi 4.5.11 里「空列表探活后被沿用」的副作用。
+- **Update 解码**（`tg_model.py`）：`message` / `edited_message` / `channel_post` /
+  `callback_query` / `chat_join_request` / `my_chat_member` 归一化；实体断点解析
+  （bold/italic/underline/strikethrough/code/pre/spoiler/mention/text_link/text_mention/br）；
+  `/cmd@bot` 剥离；相册按 `media_group_id` 聚合；**`entities: []` 空数组安全**（Koishi 会抛 TypeError）。
+- **出站渲染**（`tg_send.py`）：HTML 转义、**标签安全的超长文本分段**（Koishi 超 4096 直接报错）、
+  caption 超 1024 时媒体照发、文字另发、媒体方法映射（gif→animation、voice→sendVoice 等）、
+  多资源 `sendMediaGroup`、Inline Keyboard（每行最多 5 个）、**纯按钮消息也会发出**（Koishi 会漏发）。
+- **桥接**（`tg_bridge.py` + `__init__.py`）：Telegram ⇄ QQ 双向、方向可独立开关、
+  绑定持久化（原子写 JSON）、**回环防护**（归一化指纹 + TTL）、前缀模板、命令/机器人消息过滤。
+- **8 条快捷命令**全部注册进宿主命令表（`/help` 列表与详情可见，含别名与参数说明）：
+  `/tg`（telegram/电报）、`/tg绑定`（tgbind）、`/tg解绑`（tgunbind）、`/tg列表`（tglist/电报列表）、
+  `/tg推送`（tgsend/推送电报）、`/tg会话`（tgchats）、`/tg诊断`（tgdiag/电报诊断）、
+  `/tg重连`（tgreload）。绑定类命令用插件 `admins` 名单或宿主权限自查（fail-closed）。
+- **`telegram` 宿主服务**：`ctx.services.require("telegram")` 可取到 `status()` / `send_text()` /
+  `bindings()`，供其它插件推送。
+
+### 兼容性（实测）
+
+| 宿主 | 单元测试 | 宿主模拟器 | 静态审计 | 官方 SDK `check` |
+| --- | --- | --- | --- | --- |
+| **v2.1.0a16**（最新 release） | 57/57 | 通过 | OK | 通过（`export` 生成 `plugin.contract.json`） |
+| **v2.0.1**（最新稳定版） | 57/57 | 通过 | OK | 该版本尚无 `neobot_modloader.sdk` |
+| v2.1.0a9 | 57/57 | 通过 | OK | — |
+| v2.1.0a8 | 57/57 | 通过 | OK | — |
+| v2.1.0a7 | 57/57 | 通过 | OK | — |
+
+`plugin.toml` 的 `min_neobot_version = "2.0.0"`；只使用 `neobot_modloader` 公开 API，
+`provides=`（a15+）、`ctx.services`、`ctx.app_commands` 均按能力探测，旧宿主缺能力时降级而不是报错
+（v2.0.1 / a7 / a9 上没有 `provides` 参数，代码里 try/except 退回无服务声明）。
+
+### 已知限制
+
+- Webhook 模式未实现（插件层拿不到宿主入站 HTTP 端点），`protocol = webhook` 时按 polling 运行并告警。
+- QQ → Telegram 方向上，机器人自己的消息（含 AI 回复）能否回传取决于协议端是否上报
+  `post_type=message_sent`；插件无法拦截宿主出站，`/tg诊断` 用 `qq_bot_messages` 计数提示。
+- 未做 Koishi 那 101 个内部 API 的全量类型镜像；音视频/图片/文件已支持，贴纸/投票/位置未封装。

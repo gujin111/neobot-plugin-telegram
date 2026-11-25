@@ -1,0 +1,72 @@
+name = "telegram"
+version = "1.0.0"
+description = "Telegram 桥接：移植 Koishi Telegram 适配器（长轮询 / Webhook + QQ 互通）"
+author = "NeoBot 第三方插件"
+license = "MIT"
+tags = ["telegram", "adapter", "bridge", "im"]
+repo = "https://github.com/gujin111/neobot-plugin-telegram"
+branch = "main"
+homepage = "https://github.com/gujin111/neobot-plugin-telegram#readme"
+python_dependencies = [
+    "httpx>=0.27,<0.29",
+    "pydantic>=2,<3",
+]
+hot_reload = true
+config_hot_reload = false
+min_neobot_version = "2.0.0"
+
+# 下面只是「打包默认值」：安装/更新插件会覆盖这一段。
+# 真正的运行配置在 data/plugins_data/telegram/config.toml（面板「插件 → 配置」可改），
+# 升级插件不会丢。绑定关系在 data/plugins_data/telegram/bindings.json。
+
+[config]
+# 总开关；关闭后不连 Telegram（命令仍可用）
+enabled = true
+# BotFather 发的机器人令牌：123456:ABC-DEF...
+token = ""
+# Telegram Bot API 终结点；国内直连不通时改为反代地址
+endpoint = "https://api.telegram.org"
+# 网络代理，例如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080；留空不代理
+proxy = ""
+# 通信方式：polling（长轮询，免公网）/ webhook（需要公网 HTTPS）
+protocol = "polling"
+# 长轮询单次等待秒数
+polling_timeout = 25
+# 初次连接失败的最大重试次数（超过后进入离线状态，之后按重试间隔继续尝试）
+retry_times = 6
+# 断开后的重试间隔（秒）
+retry_interval = 5.0
+# 只接收这些类型的更新；留空 = Telegram 默认（除 chat_member 外全部）
+allowed_updates = []
+# Webhook 配置（protocol = webhook 时生效）
+webhook_path = "/telegram"
+webhook_secret = ""
+webhook_self_url = ""
+# 以 HTML 解析格式发送（Telegram parse_mode=html）
+parse_mode = "html"
+# 发送链接时展示网页预览
+link_preview = true
+# 长文本自动分段长度上限（Telegram 上限 4096）
+chunk_size = 3500
+# ── 桥接 ──
+# Telegram → QQ 的前缀；支持 {name} {chat} {id}
+prefix_from_tg = "[TG {name}] "
+# QQ → Telegram 的前缀；支持 {name} {group}
+prefix_from_qq = "[QQ {name}] "
+# 把 QQ 侧机器人自己的消息（含 AI 回复）转发到 Telegram
+forward_bot_messages = true
+# 把 QQ 侧其他成员的消息转发到 Telegram
+forward_user_messages = true
+# 把 / 开头的命令也转发到 Telegram
+forward_commands = false
+# 忽略 Telegram 侧其他机器人发的消息（防机器人互刷）
+ignore_telegram_bots = true
+# ── 权限 ──
+# 额外管理员 QQ 号 / 官方 openid：可执行绑定与推送
+admins = []
+# 允许次级管理员（permission=1）执行绑定类命令
+allow_sub_admin = true
+
+[sdk]
+version = 1
+contract = "plugin.contract.json"

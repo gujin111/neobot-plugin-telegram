@@ -1,0 +1,164 @@
+{
+  "actions": [],
+  "config": {
+    "additionalProperties": true,
+    "description": "插件配置；运行值在 data/plugins_data/telegram/config.toml。",
+    "properties": {
+      "admins": {
+        "description": "额外管理员 QQ 号 / 官方 openid：可执行绑定与推送",
+        "items": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "string"
+            }
+          ]
+        },
+        "title": "Admins",
+        "type": "array"
+      },
+      "allow_sub_admin": {
+        "default": true,
+        "description": "允许次级管理员执行绑定 / 推送类命令",
+        "title": "Allow Sub Admin",
+        "type": "boolean"
+      },
+      "allowed_updates": {
+        "description": "只接收这些类型的更新；留空 = 全部（含 chat_member，修正 Koishi 侧的默认遗漏）",
+        "items": {
+          "type": "string"
+        },
+        "title": "Allowed Updates",
+        "type": "array"
+      },
+      "chunk_size": {
+        "default": 3500,
+        "description": "长文本自动分段长度上限",
+        "maximum": 4096,
+        "minimum": 200,
+        "title": "Chunk Size",
+        "type": "integer"
+      },
+      "enabled": {
+        "default": true,
+        "description": "总开关；关闭后不连 Telegram（命令仍可用）",
+        "title": "Enabled",
+        "type": "boolean"
+      },
+      "endpoint": {
+        "default": "https://api.telegram.org",
+        "description": "Bot API 终结点；国内直连不通时改为反代地址",
+        "title": "Endpoint",
+        "type": "string"
+      },
+      "forward_bot_messages": {
+        "default": true,
+        "description": "把 QQ 侧机器人自己的消息（含 AI 回复）转发到 Telegram",
+        "title": "Forward Bot Messages",
+        "type": "boolean"
+      },
+      "forward_commands": {
+        "default": false,
+        "description": "把 / 开头的命令也转发到 Telegram",
+        "title": "Forward Commands",
+        "type": "boolean"
+      },
+      "forward_user_messages": {
+        "default": true,
+        "description": "把 QQ 侧其他成员的消息转发到 Telegram",
+        "title": "Forward User Messages",
+        "type": "boolean"
+      },
+      "ignore_telegram_bots": {
+        "default": true,
+        "description": "忽略 Telegram 侧其他机器人发的消息（防互刷）",
+        "title": "Ignore Telegram Bots",
+        "type": "boolean"
+      },
+      "link_preview": {
+        "default": true,
+        "description": "发送链接时展示网页预览",
+        "title": "Link Preview",
+        "type": "boolean"
+      },
+      "parse_mode": {
+        "default": "html",
+        "description": "发送时使用的解析格式",
+        "enum": [
+          "html",
+          "none"
+        ],
+        "title": "Parse Mode",
+        "type": "string"
+      },
+      "polling_timeout": {
+        "default": 25,
+        "description": "长轮询单次等待秒数",
+        "maximum": 60,
+        "minimum": 1,
+        "title": "Polling Timeout",
+        "type": "integer"
+      },
+      "prefix_from_qq": {
+        "default": "[QQ {name}] ",
+        "description": "QQ → Telegram 的前缀；支持 {name} {group} {id}",
+        "title": "Prefix From Qq",
+        "type": "string"
+      },
+      "prefix_from_tg": {
+        "default": "[TG {name}] ",
+        "description": "Telegram → QQ 的前缀；支持 {name} {chat} {id}",
+        "title": "Prefix From Tg",
+        "type": "string"
+      },
+      "protocol": {
+        "default": "polling",
+        "description": "通信方式；v1.0.0 只实现 polling（webhook 需要宿主提供入站 HTTP 端点）",
+        "enum": [
+          "polling",
+          "webhook"
+        ],
+        "title": "Protocol",
+        "type": "string"
+      },
+      "proxy": {
+        "default": "",
+        "description": "网络代理，例如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080",
+        "title": "Proxy",
+        "type": "string"
+      },
+      "retry_interval": {
+        "default": 5.0,
+        "description": "断开后的重试间隔（秒）",
+        "minimum": 0.5,
+        "title": "Retry Interval",
+        "type": "number"
+      },
+      "retry_times": {
+        "default": 6,
+        "description": "初次连接失败的最大重试次数",
+        "minimum": 0,
+        "title": "Retry Times",
+        "type": "integer"
+      },
+      "token": {
+        "description": "BotFather 发的机器人令牌：123456:ABC-DEF...",
+        "title": "Token",
+        "type": "string",
+        "writeOnly": true
+      }
+    },
+    "title": "Config",
+    "type": "object"
+  },
+  "guides": [],
+  "plugin": {
+    "description": "Telegram 桥接：移植 Koishi Telegram 适配器（长轮询 + QQ 双向互通）",
+    "name": "telegram",
+    "version": "1.0.0"
+  },
+  "resources": [],
+  "schema_version": 1
+}
