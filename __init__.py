@@ -92,7 +92,7 @@ class Config(BaseModel):
     endpoint: str = Field(default=DEFAULT_ENDPOINT, description="Bot API 终结点；国内直连不通时改为反代地址")
     proxy: str = Field(default="", description="网络代理，例如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080")
     protocol: Literal["polling", "webhook"] = Field(
-        default="polling", description="通信方式；v1.0.0 只实现 polling（webhook 需要宿主提供入站 HTTP 端点）"
+        default="polling", description="通信方式；当前只实现 polling（webhook 需要宿主提供入站 HTTP 端点）"
     )
     polling_timeout: int = Field(default=25, ge=1, le=60, description="长轮询单次等待秒数")
     retry_times: int = Field(default=6, ge=0, description="初次连接失败的最大重试次数")
@@ -119,7 +119,7 @@ class Config(BaseModel):
 
 
 _PLUGIN_KWARGS: dict[str, Any] = dict(
-    version="1.0.0",
+    version="1.0.1",
     description="Telegram 桥接：移植 Koishi Telegram 适配器（长轮询 + QQ 双向互通）",
     usage="发送 @机器人 /tg 查看状态；/tg绑定 建立互通（/help 可查全部命令与别名）",
     author="NeoBot 第三方插件",
@@ -163,6 +163,7 @@ class TelegramRuntime:
         self.last_error = ""
         self.state = "stopped"
         self._flush_task: asyncio.Task[None] | None = None
+        self._watchdog: asyncio.Task[None] | None = None
 
     # ── 生命周期 ──
 
@@ -198,9 +199,15 @@ class TelegramRuntime:
         if self.config.protocol != "polling":
             self.log(
                 "warning",
-                "v1.0.0 只实现 polling；已按 polling 启动（webhook 需要宿主提供入站 HTTP 端点）",
+                "当前版本只实现 polling；已按 polling 启动（webhook 需要宿主提供入站 HTTP 端点）",
                 protocol=self.config.protocol,
             )
+        self.log(
+            "info",
+            "正在连接 Telegram",
+            endpoint=(self.config.endpoint or DEFAULT_ENDPOINT),
+            proxy=(self.config.proxy or "未配置代理"),
+        )
         try:
             self.api = TelegramAPI(
                 token,
@@ -208,36 +215,81 @@ class TelegramRuntime:
                 proxy=self.config.proxy or None,
                 logger=self.ctx.logger,
             )
-            self.me = await self.api.get_me()
-            self.bot_username = str(self.me.get("username") or "")
-            self.poller = TelegramPoller(
-                self.api,
-                timeout=int(self.config.polling_timeout),
-                retry_times=int(self.config.retry_times),
-                retry_interval=float(self.config.retry_interval),
-                allowed_updates=self.config.allowed_updates or DEFAULT_ALLOWED_UPDATES,
-                on_updates=self.handle_updates,
-                on_state=self._on_state,
-                logger=self.ctx.logger,
-            )
-            self.started_at = time.time()
-            self.state = "starting"
-            await self.poller.start()
+            await self._login()
+            await self._start_poller()
             self.log(
                 "info",
                 f"Telegram 已连接：@{self.bot_username or self.me.get('id')}"
                 f"（id={self.me.get('id')}，代理={self.config.proxy or '无'}）",
             )
-        except TelegramError as exc:
-            self.state = "error"
-            self.last_error = str(exc)
-            self.log("warning", f"Telegram 连接失败：{exc}")
         except Exception as exc:  # noqa: BLE001 - 插件加载不能被网络问题打断
             self.state = "error"
             self.last_error = f"{type(exc).__name__}: {exc}"
             self.log("warning", f"Telegram 连接异常：{self.last_error}")
+            self.log("warning", "排查建议：" + _connection_hint(self.config))
+            self._schedule_watchdog()
+
+    async def _login(self) -> None:
+        assert self.api is not None
+        self.me = await self.api.get_me()
+        self.bot_username = str(self.me.get("username") or "")
+
+    async def _start_poller(self) -> None:
+        assert self.api is not None
+        self.poller = TelegramPoller(
+            self.api,
+            timeout=int(self.config.polling_timeout),
+            retry_times=int(self.config.retry_times),
+            retry_interval=float(self.config.retry_interval),
+            allowed_updates=self.config.allowed_updates or DEFAULT_ALLOWED_UPDATES,
+            on_updates=self.handle_updates,
+            on_state=self._on_state,
+            logger=self.ctx.logger,
+        )
+        self.started_at = time.time()
+        self.state = "starting"
+        await self.poller.start()
+
+    def _schedule_watchdog(self) -> None:
+        """启动失败后按间隔重试，恢复后自动接上轮询（不用手动重载）。"""
+        if self._watchdog is not None and not self._watchdog.done():
+            return
+        if self.api is None:
+            return
+
+        async def runner() -> None:
+            interval = max(15.0, float(self.config.retry_interval) * 3)
+            while self.state == "error" and self.api is not None:
+                await asyncio.sleep(interval)
+                if self.state != "error" or self.api is None:
+                    return
+                try:
+                    ok, detail = await self.api.probe(timeout=8)
+                except Exception as exc:  # noqa: BLE001
+                    self.log("debug", f"连通性复检异常：{type(exc).__name__}: {exc}")
+                    continue
+                if not ok:
+                    self.log("debug", f"Telegram 仍不可达：{detail}")
+                    continue
+                self.log("info", f"Telegram 恢复连通：{detail}，正在启动轮询")
+                try:
+                    await self._login()
+                    await self._start_poller()
+                    self.log("info", f"Telegram 已连接：@{self.bot_username or self.me.get('id')}")
+                except Exception as exc:  # noqa: BLE001
+                    self.state = "error"
+                    self.last_error = f"{type(exc).__name__}: {exc}"
+                    self.log("warning", f"恢复后启动轮询失败：{self.last_error}")
+                return
+
+        self._watchdog = asyncio.create_task(runner())
 
     async def stop(self) -> None:
+        if self._watchdog is not None:
+            self._watchdog.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._watchdog
+            self._watchdog = None
         if self._flush_task is not None:
             self._flush_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -502,7 +554,7 @@ class TelegramRuntime:
             f"· token：{masked}",
             f"· endpoint：{self.config.endpoint or DEFAULT_ENDPOINT}",
             f"· proxy：{self.config.proxy or '未设置'}",
-            f"· protocol：{self.config.protocol}（v1.0.0 实际按 polling 运行）",
+            f"· protocol：{self.config.protocol}（当前版本实际按 polling 运行）",
             f"· allowed_updates：{len(self.config.allowed_updates) or '默认（含 chat_member）'}",
             f"· 相册窗口：{self.buffer.window}s；回环防护 TTL：{self.guard.ttl}s",
             "· 计数器：" + "，".join(f"{key}={value}" for key, value in self.counters.items()),
@@ -521,9 +573,50 @@ class TelegramRuntime:
             )
         return "\n".join(lines)
 
+    async def diag_report(self) -> str:
+        """诊断 + 一次真实连通性探测（/tg诊断 用）。"""
+        lines = [self.diag_text()]
+        if self.state in ("no-token", "disabled"):
+            lines.append("· 连通性探测：跳过（未配置 token 或已禁用）")
+            return "\n".join(lines)
+        if self.api is None:
+            lines.append(f"· 客户端：未建立（state={self.state}）")
+            lines.append("· 建议：" + _connection_hint(self.config))
+            return "\n".join(lines)
+        ok, detail = await self.api.probe()
+        lines.append(f"· 连通性探测：{'通' if ok else '不通'} —— {detail}")
+        if not ok:
+            lines.append("· 建议：" + _connection_hint(self.config))
+        return "\n".join(lines)
+
 
 # 插件级单例：NeoBot 的插件是「一个插件一个运行时状态」的模型，与 bili_monitor 同风格。
 _RUNTIME: TelegramRuntime | None = None
+
+
+def _connection_hint(config: Config) -> str:
+    """连接失败时给出可执行的排查建议（覆盖国内网络最常见的三种情况）。"""
+    endpoint = (config.endpoint or DEFAULT_ENDPOINT).rstrip("/")
+    proxy = (config.proxy or "").strip()
+    if proxy:
+        hint = (
+            f"已配置代理 {proxy}：确认代理进程在运行、端口正确；"
+            "若 NeoBot 跑在容器 / WSL 里，127.0.0.1 指向容器自身，应先换成宿主机地址。"
+        )
+        if proxy.lower().startswith("socks"):
+            hint += " socks5:// 需要 socksio（依赖 httpx[socks]），缺依赖会直接连不上。"
+        return hint
+    if endpoint == DEFAULT_ENDPOINT.rstrip("/"):
+        return (
+            "当前是直连 api.telegram.org 且未配置代理：国内网络通常无法连通。"
+            "请在插件配置里填 proxy（例如 http://127.0.0.1:7890），"
+            "或把 endpoint 改成可用的反代地址"
+            "（反代需同时转发 /bot<token>/<method> 与 /file/bot<token>/...）。"
+        )
+    return (
+        f"已配置 endpoint {endpoint}：确认宿主机能访问它，且该反代把 "
+        "/bot<token>/<method> 与 /file/bot<token>/... 都转发到 api.telegram.org。"
+    )
 
 
 def _config_of(ctx: Any) -> Config:
@@ -764,7 +857,7 @@ async def _run_command(ctx: Any, runtime: TelegramRuntime, action: str, command_
         return "\n".join(lines)
 
     if action == "diag":
-        return runtime.diag_text()
+        return await runtime.diag_report()
 
     if action == "reload":
         try:

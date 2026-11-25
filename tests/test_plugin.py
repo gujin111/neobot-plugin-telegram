@@ -438,3 +438,80 @@ def test_service_facade_exposed(scratch):
     assert facade is not None
     assert "Telegram 桥接状态" in facade.status()
     assert facade.bindings() == []
+
+
+# ── 连接失败的可操作性（1.0.1） ──────────────────────────────────────
+
+
+def test_connection_hint_covers_direct_proxy_socks_and_endpoint(scratch):
+    module, _, runtime = make_runtime({"_data_dir": str(scratch)})
+    direct = module._connection_hint(runtime.config)
+    assert "未配置代理" in direct and "proxy" in direct
+    proxy = module._connection_hint(module.Config.model_validate({"proxy": "http://127.0.0.1:7890"}))
+    assert "127.0.0.1:7890" in proxy
+    socks = module._connection_hint(module.Config.model_validate({"proxy": "socks5://127.0.0.1:1080"}))
+    assert "socksio" in socks
+    endpoint = module._connection_hint(module.Config.model_validate({"endpoint": "https://tg.example"}))
+    assert "tg.example" in endpoint and "/bot<token>" in endpoint
+
+
+def test_diag_report_probes_connectivity(scratch):
+    module, ctx, runtime = make_runtime({"_data_dir": str(scratch), "token": "123456:abc"})
+
+    class Probe:
+        def __init__(self, ok):
+            self.ok = ok
+
+        async def probe(self, timeout=6.0):
+            return (self.ok, "@bot（42 ms）" if self.ok else "TelegramTransportError: boom")
+
+    runtime.api = Probe(True)
+    text = asyncio.run(runtime.diag_report())
+    assert "连通性探测：通" in text and "@bot" in text
+
+    runtime.api = Probe(False)
+    text = asyncio.run(runtime.diag_report())
+    assert "连通性探测：不通" in text
+    assert "建议" in text and "未配置代理" in text
+
+
+def test_start_failure_logs_hint_and_schedules_watchdog(scratch):
+    import contextlib
+
+    module, ctx, runtime = make_runtime({"_data_dir": str(scratch), "token": "123456:abc"})
+
+    class Boom:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def get_me(self):
+            raise RuntimeError("ConnectError: All connection attempts failed")
+
+        async def probe(self, timeout=6.0):
+            return False, "ConnectError: All connection attempts failed"
+
+        async def close(self):
+            return None
+
+    original = module.TelegramAPI
+    module.TelegramAPI = Boom
+    try:
+
+        async def scenario():
+            await runtime.start()
+            assert runtime.state == "error"
+            assert runtime._watchdog is not None
+            runtime._watchdog.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await runtime._watchdog
+            runtime._watchdog = None
+
+        asyncio.run(scenario())
+    finally:
+        module.TelegramAPI = original
+
+    log = ctx.logger.text()
+    assert "Telegram 连接异常" in log
+    assert "排查建议" in log and "未配置代理" in log
+    assert "endpoint" in log  # 启动日志里打印了实际使用的 endpoint
+

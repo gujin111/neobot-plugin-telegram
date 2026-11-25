@@ -64,6 +64,27 @@ NeoBot 的协议适配器（OneBot / QQ 官方 / local）是**宿主自己的核
 
 ---
 
+## 连不上 Telegram 怎么办
+
+日志里出现下面这条，是**网络层不通**（不是插件 bug）：
+
+```text
+Telegram 连接异常：TelegramTransportError: Telegram transport error on getMe:
+ConnectError: All connection attempts failed
+```
+
+`All connection attempts failed` 表示 TCP 连不上 `api.telegram.org`（解析出的地址全试过都失败）。
+按你的实际情况选一条：
+
+| 情况 | 怎么配 |
+| --- | --- |
+| 有代理软件（Clash / v2ray 等） | `proxy = "http://127.0.0.1:7890"`（端口换成你软件里的 HTTP 端口）；SOCKS5 写 `socks5://127.0.0.1:1080`，依赖 `httpx[socks]`（1.0.1 起默认安装） |
+| NeoBot 跑在容器 / WSL 里 | `127.0.0.1` 指向容器自身，要填宿主机地址（如 `http://host.docker.internal:7890`）或网关 IP |
+| 没有代理 | 自建反代（Cloudflare Worker / Nginx），把 `endpoint` 指向它；反代必须同时转发 `/bot<token>/<method>` 和 `/file/bot<token>/...` |
+
+改完保存 → 面板里重载插件（或 `/tg重连`）。1.0.1 起启动失败会每 15 秒自动复检一次，
+连通后自己接上轮询，不用反复重启；`/tg诊断` 会做一次真实 `getMe` 探测，直接告诉你通没通、耗时多少、下一步该改什么。
+
 ## 命令（全部注册进宿主命令表 → `/help` 可见）
 
 | 命令 | 别名 | 权限 | 说明 |
@@ -90,7 +111,7 @@ NeoBot 的协议适配器（OneBot / QQ 官方 / local）是**宿主自己的核
 | `token` | 空 | BotFather 令牌；空值只打日志、插件待机 |
 | `endpoint` | `https://api.telegram.org` | 反代地址；配合反向代理时改这里 |
 | `proxy` | 空 | `http://` / `socks5://` 代理；**国内必需** |
-| `protocol` | `polling` | v1.0.0 只实现 `polling`（见已知限制） |
+| `protocol` | `polling` | 当前只实现 `polling`（见已知限制） |
 | `polling_timeout` | `25` | 长轮询等待秒数 |
 | `retry_times` / `retry_interval` | `6` / `5.0` | 初次连接重试次数 / 断开后重试间隔 |
 | `allowed_updates` | 空 = 全集 | 留空即包含 `chat_member`（修正 Koishi 侧默认遗漏） |
@@ -135,7 +156,7 @@ NeoBot 的协议适配器（OneBot / QQ 官方 / local）是**宿主自己的核
 | 超长文本 | 直接报错 | ✅ 标签安全分段 |
 | 纯按钮消息 | `flush()` 守卫会漏发 | ✅ 仍会发送 |
 | `entities: []` | `entities?.[0].type` 抛 TypeError | ✅ 空数组安全 |
-| Webhook | ✅ | ❌ v1.0.0 未实现（插件层拿不到宿主入站 HTTP 端点） |
+| Webhook | ✅ | ❌ 未实现（插件层拿不到宿主入站 HTTP 端点） |
 | 内部 API 101 个方法 | ✅ 动态生成 | 未做全量镜像；需要时用 `httpx` 直调或提需求 |
 | 发贴纸 / 投票 / 位置 | 部分 | 未封装（音视频/图片/文件已支持） |
 

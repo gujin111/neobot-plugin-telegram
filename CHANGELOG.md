@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.0.1
+
+修「连不上时不知道该怎么办」，并把启动失败变成可自愈。
+
+### 修复
+
+- **连接失败给出可执行建议**。`TelegramTransportError: ... All connection attempts failed`
+  这类错误按四种情况分别提示：直连且未配代理 / 代理地址不合法 / `socks5://` 缺 socksio /
+  反代没转发 `/bot<token>/...`。日志同时打印实际使用的 `endpoint` 与 `proxy`。
+- **启动失败不再一错到底**：新增看门狗，按 `max(15s, retry_interval×3)` 复检连通性，
+  恢复后自动登录并接上轮询；`/tg重连` 仍可立即重试。
+- **`/tg诊断` 增加真实连通性探测**（`getMe`，6s 超时）：显示"通/不通 + 耗时 + 原因 + 建议"。
+
+### 变更
+
+- `python_dependencies` 改为 `httpx[socks]>=0.27,<0.29`：支持 `socks5://` 代理。
+- 代理地址不合法（例如漏了 `http://`）时给出明确错误，而不是把底层 `ValueError` 抛给用户。
+
 ## 1.0.0
 
 首个版本：把 Koishi 的 `@koishijs/plugin-adapter-telegram`（`@satorijs/adapter-telegram` 4.5.x）

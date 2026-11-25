@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import random
+import time
 from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -84,12 +85,28 @@ class TelegramRetryAfter(Exception):
         super().__init__(f"Telegram rate limited on {method}, retry after {retry_after}s")
 
 
-def _build_client_kwargs(proxy: str | None, timeout: float) -> dict[str, Any]:
-    """httpx 0.26 用 ``proxy=``，更早版本用 ``proxies=``；两者都试。"""
+def _make_client(proxy: str | None, timeout: float, *, method: str = "client") -> httpx.AsyncClient:
+    """建 httpx 客户端：兼容 httpx 新旧代理参数，并把 socks 缺依赖翻译成人话。"""
     kwargs: dict[str, Any] = {"timeout": timeout, "follow_redirects": True}
     if proxy:
         kwargs["proxy"] = proxy
-    return kwargs
+    try:
+        return httpx.AsyncClient(**kwargs)
+    except TypeError:
+        # httpx < 0.26 只认 proxies=
+        if proxy:
+            kwargs.pop("proxy", None)
+            kwargs["proxies"] = proxy
+        return httpx.AsyncClient(**kwargs)
+    except ImportError as exc:
+        raise TelegramTransportError(
+            method,
+            f"代理不可用：{exc}。socks5:// 需要 socksio，请安装 httpx[socks] 后重载插件。",
+        ) from exc
+    except ValueError as exc:
+        raise TelegramTransportError(
+            method, f"代理地址不合法（{proxy!r}）：代理要带协议头，如 http://127.0.0.1:7890。{exc}"
+        ) from exc
 
 
 class TelegramAPI:
@@ -125,8 +142,21 @@ class TelegramAPI:
     @property
     def client(self) -> httpx.AsyncClient:
         if self._client is None:
-            self._client = httpx.AsyncClient(**_build_client_kwargs(self.proxy, self._timeout))
+            self._client = _make_client(self.proxy, self._timeout, method="client")
         return self._client
+
+    async def probe(self, *, timeout: float = 6.0) -> tuple[bool, str]:
+        """快速连通性探测（getMe + 短超时），供 /tg诊断 使用。"""
+        started = time.monotonic()
+        try:
+            me = await self.call("getMe", timeout=timeout)
+        except (TelegramError, TelegramTransportError, TelegramRetryAfter) as exc:
+            return False, f"{type(exc).__name__}: {exc}"
+        except Exception as exc:  # noqa: BLE001
+            return False, f"{type(exc).__name__}: {exc}"
+        elapsed = (time.monotonic() - started) * 1000
+        name = (me or {}).get("username") or (me or {}).get("id")
+        return True, f"@{name}（{elapsed:.0f} ms）"
 
     async def close(self) -> None:
         if self._client is not None and self._owns_client:
@@ -151,6 +181,7 @@ class TelegramAPI:
         *,
         files: Sequence[tuple[str, tuple[str, bytes, str]]] | None = None,
         retries: int | None = None,
+        timeout: float | None = None,
     ) -> Any:
         """调用 Bot API 方法。
 
@@ -166,9 +197,11 @@ class TelegramAPI:
         for attempt in range(attempts + 1):
             try:
                 if files:
-                    response = await self.client.post(url, data=_stringify(payload), files=list(files))
+                    response = await self.client.post(
+                        url, data=_stringify(payload), files=list(files), timeout=timeout
+                    )
                 else:
-                    response = await self.client.post(url, json=payload)
+                    response = await self.client.post(url, json=payload, timeout=timeout)
             except Exception as exc:  # noqa: BLE001 - httpx 的各种网络异常
                 last_error = TelegramTransportError(method, f"{type(exc).__name__}: {exc}")
                 if attempt >= attempts:
