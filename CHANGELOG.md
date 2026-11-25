@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.1.0
+
+代理能力内置：`socks5://` 不需要再装 `socksio`，`proxy` 还能自己找端口。
+
+### 新增
+
+- `tg_proxy.py`：纯 asyncio 的 **SOCKS5 客户端**（RFC 1928/1929；域名与 IPv4 目标、无认证或账号密码）
+  ＋ **本地 HTTP CONNECT 网关**。配置 `proxy = "socks5://…"` 时，插件在 `127.0.0.1` 起一个随机端口的
+  隧道交给 httpx，因此容器里只要有基础 httpx 就能连 SOCKS5，**不引入任何新依赖**。
+- `proxy = "auto"`：按 `127.0.0.1` 与 `host.docker.internal` × 常见端口
+  （7890/7891/7897/1080/10808/10809/20171/3128/8889）做 TCP 探测，命中即用，省得手算端口。
+
+### 变更
+
+- `python_dependencies` 回退为 `httpx`（不再需要 `httpx[socks]`）。
+- `/tg诊断` 显示 proxy 的实际解析结果与内置网关地址；`auto` 未命中时明确告警并提示改成显式地址。
+- 连接失败建议同步更新：socks5 不再提示装 socksio，改为提示"端口是否提供 SOCKS5 / 账号密码是否正确"。
+
+### 验证
+
+- pytest 69/69（新增 7 项：代理地址解析、SOCKS5 握手成功/认证失败/代理不可达、
+  网关 CONNECT 隧道端到端、非 CONNECT 请求 405、`auto` 探测）。
+- `devtools/simulate.py` 通过；干净副本 `neobot_modloader.sdk check` 通过；契约重新导出为 1.1.0。
+
 ## 1.0.2
 
 把反代做成插件的一等配置，不用再手拼 URL；`extras/` 一并入库。

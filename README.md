@@ -64,6 +64,36 @@ NeoBot 的协议适配器（OneBot / QQ 官方 / local）是**宿主自己的核
 
 ---
 
+### 内置代理（HTTP / SOCKS5，不需要额外依赖）
+
+不想手算端口、也不想装 `socksio` 时：
+
+```toml
+# 1) 知道地址就直填
+proxy = "http://host.docker.internal:7890"
+proxy = "socks5://host.docker.internal:7890"   # SOCKS5 由插件自己握手
+
+# 2) 不知道端口：让插件自己找（默认端口 7890/7891/7897/1080/10808/10809/20171/3128/8889）
+proxy = "auto"
+
+# 3) 不代理
+proxy = ""
+```
+
+实现方式：HTTP 代理直接交给 httpx；**SOCKS5 走插件内置的本地网关**——插件在
+`127.0.0.1` 上起一个随机端口的 HTTP CONNECT 隧道（只监听本机、用完即关），内部用
+纯 asyncio 完成 SOCKS5 握手（RFC 1928/1929，支持域名/IPv4、无认证或账号密码）。
+所以容器里只要有基础 httpx 就能连 SOCKS5，不用再装任何依赖。
+
+`/tg诊断` 会显示实际解析结果，例如：
+
+```
+· proxy：socks5://host.docker.internal:7890（内置 SOCKS5 网关：http://127.0.0.1:52341）
+· proxy：auto → 127.0.0.1:7890
+```
+
+> `auto` 只做 TCP 探测（快），没探到会明确告警并提示改成显式地址。
+
 ## 连不上 Telegram 怎么办
 
 日志里出现下面这条，是**网络层不通**（不是插件 bug）：
@@ -78,7 +108,7 @@ ConnectError: All connection attempts failed
 
 | 情况 | 怎么配 |
 | --- | --- |
-| 有代理软件（Clash / v2ray 等） | `proxy = "http://127.0.0.1:7890"`（端口换成你软件里的 HTTP 端口）；SOCKS5 写 `socks5://127.0.0.1:1080`，依赖 `httpx[socks]`（1.0.1 起默认安装） |
+| 有代理软件（Clash / v2ray 等） | `proxy = "http://127.0.0.1:7890"`（端口换成你软件里的 HTTP 端口）；SOCKS5 写 `socks5://127.0.0.1:1080`（**内置握手，不需要 socksio**）；不知道端口就写 `proxy = "auto"` |
 | NeoBot 跑在容器 / WSL 里 | `127.0.0.1` 指向容器自身，要填宿主机地址（如 `http://host.docker.internal:7890`）或网关 IP —— 不确定就先在容器里跑 [`extras/find-proxy.py`](extras/find-proxy.py)，它会试出并打印可用地址 |
 | **没有代理 / 不想折腾** | **用插件内置的反代配置**（推荐，见下一节），不需要任何本地代理软件 |
 
@@ -128,7 +158,7 @@ ConnectError: All connection attempts failed
 | `endpoint` | `https://api.telegram.org` | 反代地址；与下面的 `reverse_proxy_url` 二选一 |
 | `reverse_proxy_url` | 空 | **反代基址**（如 `https://tg.example.workers.dev`）；填了优先于 `endpoint` |
 | `reverse_proxy_secret` | 空 | 反代路径密钥，与 Worker 的 `PATH_SECRET` 一致；插件自动拼成 `{基址}/{密钥}` |
-| `proxy` | 空 | `http://` / `socks5://` 代理；**国内必需** |
+| `proxy` | 空 | **内置代理客户端**：`http://…`、`socks5://…`（自行握手，不需要 socksio）、或 `auto` 自动探测宿主端口 |
 | `protocol` | `polling` | 当前只实现 `polling`（见已知限制） |
 | `polling_timeout` | `25` | 长轮询等待秒数 |
 | `retry_times` / `retry_interval` | `6` / `5.0` | 初次连接重试次数 / 断开后重试间隔 |

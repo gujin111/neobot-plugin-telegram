@@ -454,7 +454,7 @@ def test_connection_hint_covers_direct_proxy_socks_and_endpoint(scratch):
     proxy = module._connection_hint(module.Config.model_validate({"proxy": "http://127.0.0.1:7890"}))
     assert "127.0.0.1:7890" in proxy
     socks = module._connection_hint(module.Config.model_validate({"proxy": "socks5://127.0.0.1:1080"}))
-    assert "socksio" in socks
+    assert "内置" in socks and "SOCKS5" in socks
     endpoint = module._connection_hint(module.Config.model_validate({"endpoint": "https://tg.example"}))
     assert "tg.example" in endpoint and "/bot<token>" in endpoint
 

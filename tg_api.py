@@ -26,6 +26,11 @@ from typing import Any
 
 import httpx
 
+try:  # 包形式由 NeoBot 加载
+    from .tg_proxy import ProxyUnavailable, SocksGateway, parse_proxy
+except ImportError:  # pragma: no cover - 顶层模块加载（pytest 收集 / 脚本方式）
+    from tg_proxy import ProxyUnavailable, SocksGateway, parse_proxy  # type: ignore[no-redef]
+
 DEFAULT_ENDPOINT = "https://api.telegram.org"
 
 #: Telegram 在「除 chat_member 外全部」之上，我们默认补上的更新类型
@@ -101,7 +106,7 @@ def _make_client(proxy: str | None, timeout: float, *, method: str = "client") -
     except ImportError as exc:
         raise TelegramTransportError(
             method,
-            f"代理不可用：{exc}。socks5:// 需要 socksio，请安装 httpx[socks] 后重载插件。",
+            f"代理不可用：{exc}。socks5:// 由插件内置实现，若这里报缺包，说明代理地址被当成了别的协议。",
         ) from exc
     except ValueError as exc:
         raise TelegramTransportError(
@@ -136,6 +141,48 @@ class TelegramAPI:
         self._file_timeout = file_timeout
         self._client = client
         self._owns_client = client is None
+        self._gateway: SocksGateway | None = None
+        self._prepared = False
+        self._prepare_lock: asyncio.Lock | None = None
+
+    # ── 代理准备 ──
+
+    @property
+    def gateway_url(self) -> str:
+        """内置 SOCKS5 网关的本地地址（没启用时为空）。"""
+        return self._gateway.url if self._gateway is not None else ""
+
+    async def prepare(self) -> None:
+        """按需建客户端：HTTP 代理直接交给 httpx，SOCKS5 先起本地网关（无需 socksio）。"""
+        if self._prepared:
+            return
+        if self._prepare_lock is None:
+            self._prepare_lock = asyncio.Lock()
+        async with self._prepare_lock:
+            if self._prepared:
+                return
+            proxy_url: str | None = None
+            endpoint = parse_proxy(self.proxy)
+            if endpoint is not None:
+                if endpoint.kind == "http":
+                    proxy_url = endpoint.http_url()
+                else:
+                    gateway = SocksGateway(endpoint, logger=self._logger)
+                    try:
+                        proxy_url = await gateway.start()
+                    except ProxyUnavailable:
+                        raise
+                    self._gateway = gateway
+                    self._log(
+                        "info",
+                        "已启用内置 SOCKS5 网关",
+                        proxy=endpoint.label,
+                        local=proxy_url,
+                    )
+            if self._client is None:
+                self._client = _make_client(proxy_url, self._timeout, method="client")
+                self._owns_client = True
+            self._prepared = True
 
     # ── 客户端 ──
 
@@ -162,6 +209,10 @@ class TelegramAPI:
         if self._client is not None and self._owns_client:
             await self._client.aclose()
         self._client = None
+        if self._gateway is not None:
+            await self._gateway.stop()
+            self._gateway = None
+        self._prepared = False
 
     def _log(self, level: str, message: str, **fields: Any) -> None:
         logger = self._logger
@@ -190,6 +241,7 @@ class TelegramAPI:
         :class:`TelegramTransportError`，限流抛 :class:`TelegramRetryAfter`。
         """
         url = f"{self.endpoint}/bot{self.token}/{method}"
+        await self.prepare()
         payload = {k: v for k, v in (params or {}).items() if v is not None}
         attempts = self.max_retries if retries is None else max(0, int(retries))
         last_error: Exception | None = None
@@ -289,6 +341,7 @@ class TelegramAPI:
 
     async def download_file(self, file_path: str) -> tuple[bytes, str]:
         """按 ``file_path`` 下载（``getFile`` 返回的路径），返回 (bytes, mime)。"""
+        await self.prepare()
         url = f"{self.endpoint}/file/bot{self.token}/{file_path.lstrip('/')}"
         try:
             response = await self.client.get(url, timeout=self._file_timeout)

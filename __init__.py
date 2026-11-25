@@ -55,6 +55,7 @@ try:  # 正常路径：NeoBot 以包的形式加载 plugins/telegram/
         render_tg_to_qq,
     )
     from .tg_model import IncomingEvent, MediaGroupBuffer, decode_update, update_subtype
+    from .tg_proxy import ProxyUnavailable, detect_proxy, parse_proxy
     from .tg_send import PlanOptions, SendAction, build_actions, render_segments
 except ImportError:  # pragma: no cover - 顶层模块加载（pytest 收集 / 手工脚本）
     from tg_api import (
@@ -77,6 +78,7 @@ except ImportError:  # pragma: no cover - 顶层模块加载（pytest 收集 / �
         render_tg_to_qq,
     )
     from tg_model import IncomingEvent, MediaGroupBuffer, decode_update, update_subtype
+    from tg_proxy import ProxyUnavailable, detect_proxy, parse_proxy
     from tg_send import PlanOptions, SendAction, build_actions, render_segments
 
 # ── 配置 ─────────────────────────────────────────────────────────────
@@ -97,7 +99,11 @@ class Config(BaseModel):
     reverse_proxy_secret: str = Field(
         default="", description="反代路径密钥，与 Worker 的 PATH_SECRET 一致；Worker 没设密钥时留空"
     )
-    proxy: str = Field(default="", description="网络代理，例如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080")
+    proxy: str = Field(
+        default="",
+        description="网络代理：http://127.0.0.1:7890、socks5://127.0.0.1:1080"
+        "（内置实现，不需要 socksio），或 auto 自动探测宿主上的 Clash / v2ray 端口",
+    )
     protocol: Literal["polling", "webhook"] = Field(
         default="polling", description="通信方式；当前只实现 polling（webhook 需要宿主提供入站 HTTP 端点）"
     )
@@ -126,7 +132,7 @@ class Config(BaseModel):
 
 
 _PLUGIN_KWARGS: dict[str, Any] = dict(
-    version="1.0.2",
+    version="1.1.0",
     description="Telegram 桥接：移植 Koishi Telegram 适配器（长轮询 + QQ 双向互通）",
     usage="发送 @机器人 /tg 查看状态；/tg绑定 建立互通（/help 可查全部命令与别名）",
     author="NeoBot 第三方插件",
@@ -169,6 +175,7 @@ class TelegramRuntime:
         }
         self.last_error = ""
         self.state = "stopped"
+        self.resolved_proxy = ""
         self._flush_task: asyncio.Task[None] | None = None
         self._watchdog: asyncio.Task[None] | None = None
 
@@ -210,18 +217,19 @@ class TelegramRuntime:
                 protocol=self.config.protocol,
             )
         endpoint, source = _resolve_endpoint(self.config)
+        proxy_value = await self._resolve_proxy_value()
         self.log(
             "info",
             "正在连接 Telegram",
             endpoint=_mask_endpoint(endpoint, self.config),
             source=source,
-            proxy=(self.config.proxy or "未配置代理"),
+            proxy=(proxy_value or "未配置代理"),
         )
         try:
             self.api = TelegramAPI(
                 token,
                 endpoint=endpoint,
-                proxy=self.config.proxy or None,
+                proxy=proxy_value or None,
                 logger=self.ctx.logger,
             )
             await self._login()
@@ -237,6 +245,40 @@ class TelegramRuntime:
             self.log("warning", f"Telegram 连接异常：{self.last_error}")
             self.log("warning", "排查建议：" + _connection_hint(self.config))
             self._schedule_watchdog()
+
+    async def _resolve_proxy_value(self) -> str:
+        """``proxy = "auto"`` 时在宿主上找代理端口；其它值原样返回。"""
+        raw = (self.config.proxy or "").strip()
+        if raw.lower() != "auto":
+            self.resolved_proxy = raw
+            return raw
+        detected = await detect_proxy()
+        self.resolved_proxy = detected
+        if detected:
+            self.log("info", "proxy=auto 已探测到宿主代理", proxy=detected)
+        else:
+            self.log(
+                "warning",
+                "proxy=auto 没找到可用代理端口（试过 127.0.0.1 / host.docker.internal 的常见端口）；"
+                '改成显式地址，例如 proxy = "http://host.docker.internal:7890"',
+            )
+        return detected
+
+    def _proxy_line(self) -> str:
+        """诊断用：把 proxy 配置与实际解析结果写清楚（不泄露密码）。"""
+        raw = (self.config.proxy or "").strip()
+        if not raw:
+            return "未设置（直连）"
+        if raw.lower() == "auto":
+            return f"auto → {self.resolved_proxy or '未探测到'}"
+        gateway = getattr(self.api, "gateway_url", "") if self.api is not None else ""
+        if gateway:
+            try:
+                endpoint = parse_proxy(raw)
+            except ProxyUnavailable:
+                endpoint = None
+            return f"{endpoint.label if endpoint else raw}（内置 SOCKS5 网关：{gateway}）"
+        return raw
 
     async def _login(self) -> None:
         assert self.api is not None
@@ -564,7 +606,7 @@ class TelegramRuntime:
             f"· 版本：{plugin.version}（min_neobot_version 2.0.0）",
             f"· token：{masked}",
             f"· endpoint：{_mask_endpoint(endpoint, self.config)}（来源：{_source_label(source)}）",
-            f"· proxy：{self.config.proxy or '未设置'}",
+            f"· proxy：{self._proxy_line()}",
             f"· protocol：{self.config.protocol}（当前版本实际按 polling 运行）",
             f"· allowed_updates：{len(self.config.allowed_updates) or '默认（含 chat_member）'}",
             f"· 相册窗口：{self.buffer.window}s；回环防护 TTL：{self.guard.ttl}s",
@@ -638,13 +680,21 @@ def _connection_hint(config: Config) -> str:
     endpoint, source = _resolve_endpoint(config)
     proxy = (config.proxy or "").strip()
     tips: list[str] = []
+    if (config.proxy or "").strip().lower() == "auto":
+        tips.append(
+            "proxy=auto 只做 TCP 探测：没探到就改成显式地址"
+            "（容器里通常是 http://host.docker.internal:7890）。"
+        )
     if proxy:
         tips.append(
             f"已配置代理 {proxy}：确认代理进程在运行、端口正确；"
             "若 NeoBot 跑在容器 / WSL 里，127.0.0.1 指向容器自身，应改用宿主地址。"
         )
         if proxy.lower().startswith("socks"):
-            tips.append("socks5:// 需要 socksio（依赖 httpx[socks]），缺依赖会直接连不上。")
+            tips.append(
+                "socks5:// 由插件内置握手（不需要 socksio）：握手失败通常是端口不提供 SOCKS5，"
+                "或账号密码不对（Clash 的 mixed 端口同时支持 HTTP 与 SOCKS5）。"
+            )
     if source == "reverse_proxy":
         tips.append(
             f"已配置反代 {_mask_endpoint(endpoint, config)}：确认 Worker 已部署、"
