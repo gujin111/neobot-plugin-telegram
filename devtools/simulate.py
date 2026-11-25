@@ -1,16 +1,9 @@
 """宿主模拟器：不连 Telegram、不启动 NeoBot，直接看命令与「独立 TG 对话」链路。
 
-跑法（插件目录内，PYTHONPATH 指向 NeoBot 的 packages/*/src）：
-
     python devtools/simulate.py
 
-验证：
-
-1. `/help` 只剩两条状态命令；
-2. TG 消息 → 宿主 provider（假模型）→ 文本回 TG，且带上 system_prompt；
-3. 第二轮消息带上了上一轮上下文；
-4. provider 缺失 / 报错时的降级提示；
-5. `/tg诊断` 的连通性探测与模型服务可用性。
+验证：命令只有两条 → TG 消息驱动宿主模型 → 文本回 TG（带 system_prompt）→
+第二轮带上下文 → 没有 provider 时给提示 → 状态与诊断输出正常。
 """
 
 from __future__ import annotations
@@ -61,7 +54,7 @@ class Logger:
     def __init__(self) -> None:
         self.lines: list[str] = []
 
-    def _push(self, level: str, message, **fields) -> None:
+    def _push(self, level, message, **fields):
         self.lines.append(f"{level} {message}" + "".join(f" {k}={v}" for k, v in fields.items()))
 
     def info(self, message, **fields):
@@ -86,8 +79,8 @@ class AppCommands:
     def register(self, name, *, description="", usage="", permission=0, aliases=(), params=()):
         def decorate(handler):
             self.commands[name] = SimpleNamespace(
-                name=name, handler=handler, description=description,
-                usage=usage, permission=permission, aliases=tuple(aliases), params=tuple(params),
+                name=name, handler=handler, description=description, usage=usage,
+                permission=permission, aliases=tuple(aliases), params=tuple(params),
             )
             return handler
 
@@ -97,9 +90,6 @@ class AppCommands:
 class Services:
     def __init__(self, provided: dict) -> None:
         self.provided = dict(provided)
-
-    def provide(self, name, service, **kwargs):
-        self.provided[name] = service
 
     def get(self, name, default=None):
         return self.provided.get(name, default)
@@ -119,7 +109,7 @@ class FakeAPI:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict]] = []
 
-    async def call(self, method, params=None, *, files=None, retries=None):
+    async def call(self, method, params=None):
         self.calls.append((method, dict(params or {})))
         return {"message_id": len(self.calls)}
 
@@ -132,14 +122,11 @@ class FakeAPI:
     async def close(self):
         return None
 
-    @property
-    def gateway_url(self) -> str:
-        return ""
+    def texts(self) -> list[str]:
+        return [params.get("text", "") for method, params in self.calls if method == "sendMessage"]
 
 
 class FakeProvider:
-    """模拟宿主的 provider：返回固定文案，并记录收到的 messages。"""
-
     def __init__(self, reply: str) -> None:
         self.reply = reply
         self.calls: list[list[dict]] = []
@@ -171,13 +158,10 @@ def main() -> int:
     provider = FakeProvider("我是 NeoBot，很高兴在 Telegram 见到你。")
     config = {
         "token": "123456:SIMULATED",
-        "reverse_proxy_url": "https://tg.example.com",
-        "reverse_proxy_secret": "v1-demo",
         "system_prompt": "你是 NeoBot，回答简短。",
         "history_limit": 6,
     }
     ctx = Context(workdir, provider=provider)
-    ctx.config = config
     cfg = module.Config.model_validate(config)
 
     print("== /help 命令展示页 ==")
@@ -186,7 +170,6 @@ def main() -> int:
         print(f"  /{name}  别名：{'、'.join(command.aliases) or '无'}")
         print(f"      {command.description}")
     check("只注册两条状态命令", set(ctx.app_commands.commands) == {"tg", "tg诊断"})
-    check("没有任何 QQ/桥接命令", "tg绑定" not in ctx.app_commands.commands)
 
     runtime = module.TelegramRuntime(ctx, cfg)
     runtime.api = FakeAPI()
@@ -195,16 +178,15 @@ def main() -> int:
 
     print("\n== 第一条 TG 消息 ==")
     asyncio.run(runtime.handle_updates([tg_update(21, "你好，介绍一下你自己")]))
-    check("调用了宿主模型服务", len(provider.calls) == 1, str(provider.calls))
+    check("调用了宿主模型服务", len(provider.calls) == 1)
     if provider.calls:
         messages = provider.calls[0]
         print(f"  system：{messages[0]['content']!r}")
         print(f"  user  ：{messages[-1]['content']!r}")
         check("system_prompt 已带上", messages[0]["role"] == "system")
-    sent = [params.get("text", "") for _, params in runtime.api.calls]
+    sent = runtime.api.texts()
     print(f"  回给 Telegram：{sent[-1]!r}" if sent else "  没有发送")
     check("模型文本回传到 TG", bool(sent) and "我是 NeoBot" in sent[-1])
-    check("计数器记录回复", runtime.counters["ai_replies"] == 1)
 
     print("\n== 第二条（验证上下文）==")
     asyncio.run(runtime.handle_updates([tg_update(22, "刚才你说了什么？")]))
@@ -214,11 +196,11 @@ def main() -> int:
     check("历史含上一轮提问", any(item["content"] == "你好，介绍一下你自己" for item in messages))
 
     print("\n== 没有 provider 时 ==")
-    bare = module.TelegramRuntime(Context(workdir), module.Config.model_validate({"token": "1:a"}))
+    bare = module.TelegramRuntime(Context(workdir), module.Config.model_validate({}))
     bare.api = FakeAPI()
     asyncio.run(bare.reply_with_ai(module.decode_update(tg_update(23, "hi"))))
-    print(f"  回给用户：{bare.api.calls[-1][1]['text']!r}")
-    check("提示缺少模型服务", "provider" in bare.api.calls[-1][1]["text"])
+    print(f"  回给用户：{bare.api.texts()[-1]!r}")
+    check("提示缺少模型服务", "provider" in bare.api.texts()[-1])
 
     print("\n== /tg状态 ==")
     print("\n".join("  " + line for line in runtime.status_text().splitlines()))

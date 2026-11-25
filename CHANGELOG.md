@@ -1,5 +1,33 @@
 # Changelog
 
+## 3.0.0
+
+**瘦身**：删掉所有用不到的能力，代码量减半。功能不变——TG 用户照旧和 AI 对话，用户照旧只填 token。
+
+### 删掉的东西
+
+| 删掉的 | 原因 |
+| --- | --- |
+| `tg_proxy.py`（293 行）：内置 SOCKS5 客户端、本地 CONNECT 网关、`auto` 探测 | 默认走反代后没人需要；`proxy` 现在直接交给 httpx，只支持 http(s) 代理 |
+| `extras/find-proxy.py`、`extras/windows-host-proxy.ps1` | 都是为 `auto` 探测服务的 |
+| 标签平衡渲染、媒体发送、内联按钮、`OutgoingMedia`/`SendAction`/`PlanOptions`（tg_send 442 → 34 行） | 我们只发 AI 的纯文本：整体转义后按段落分段即可 |
+| 实体解析、`Span`、相册聚合 `MediaGroupBuffer`（tg_model 492 → 152 行） | 富文本还原与相册合并对"把文本交给模型"没有意义 |
+| `download_file` / `set_webhook` / `edit_message_text` / `delete_message` / 多部分上传（tg_api 493 → 392 行） | 只保留收发消息必需的调用 |
+| 服务门面（`provides=["telegram"]`）、`reconnect()`、`MediaGroupBuffer` 刷新任务 | 没有消费者 |
+| 配置项：`protocol`、`allowed_updates`、`parse_mode`、`link_preview`、`chunk_size` | 固定为 polling / 全集 / HTML / 无预览 / 3500 字 |
+
+### 现状
+
+- 运行时 4 个文件共 **1167 行**（原 2399 行，减半）：`__init__.py` 589、`tg_api.py` 392、`tg_model.py` 152、`tg_send.py` 34；
+- 配置 15 项，其中只有 `token` 必填；
+- 命令仍只有 `/tg`、`/tg诊断`；
+- 计数器简化为 `updates / messages / replies / failures / errors`。
+
+### 验证
+
+pytest **46/46**（测试同步精简：出站只剩转义与分段、解码只剩拍平、客户端只留轮询与重试）；
+`devtools/simulate.py` 通过；干净副本 `sdk check` 通过；契约导出 3.0.0。
+
 ## 2.3.0
 
 给内置反代加**请求头校验**：只拿到地址也用不了。

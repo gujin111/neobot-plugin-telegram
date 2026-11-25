@@ -1,6 +1,6 @@
 name = "telegram"
-version = "2.3.0"
-description = "Telegram 独立 Bot：只填 token 即可用（内置反代 + 请求头校验），不涉及 QQ"
+version = "3.0.0"
+description = "Telegram 独立 Bot：只填 token 即可用（内置反代），AI 由宿主模型驱动"
 author = "NeoBot 第三方插件"
 license = "MIT"
 tags = ["telegram", "im", "chat", "adapter"]
@@ -23,34 +23,25 @@ min_neobot_version = "2.0.0"
 enabled = true
 # BotFather 发的机器人令牌：123456:ABC-DEF...
 token = ""
-# Telegram Bot API 终结点；反代留空时才用它
-endpoint = "https://api.telegram.org"
-# 默认走内置反代：用户只填 token 就能用，不需要代理/域名
-# 想直连或用自己的反代，把这一行清空 / 改成自己的地址
+
+# ── 网络：默认走内置反代，所以只需要 token ──
+# 反代基址；留空则改用 endpoint / proxy 直连
 reverse_proxy_url = "https://tg.gujin99.xyz"
-# 内置反代的路径密钥；换成自己的反代时改成自己的
+# 反代路径密钥，与 Worker 的 PATH_SECRET 一致
 reverse_proxy_secret = "v1-a5e68cb17320"
-# 反代请求头密钥（X-Proxy-Key）；与 Worker 的 PROXY_KEY 一致，自建时改成自己的
+# 反代请求头密钥（X-Proxy-Key），与 Worker 的 PROXY_KEY 一致
 proxy_key = "pk-a5e68cb17320"
-# 网络代理。支持 http://…、socks5://…（内置实现，不需要 socksio），或 auto 自动探测；留空直连
+# Bot API 终结点；反代留空时才用它
+endpoint = "https://api.telegram.org"
+# http(s) 代理，如 http://127.0.0.1:7890；SOCKS 请填代理软件的 HTTP 端口
 proxy = ""
-# 通信方式：polling（长轮询，免公网）
-protocol = "polling"
 # 长轮询单次等待秒数
 polling_timeout = 25
-# 初次连接失败的最大重试次数
+# 连续失败多少次后放弃（0 = 一直重试）
 retry_times = 6
-# 断开后的重试间隔（秒）
+# 失败重试间隔（秒）
 retry_interval = 5.0
-# 只接收这些类型的更新；留空 = 全部（含 chat_member）
-allowed_updates = []
-# 以 HTML 解析格式发送
-parse_mode = "html"
-# 发送链接时展示网页预览
-link_preview = true
-# 长文本自动分段长度上限（Telegram 上限 4096）
-chunk_size = 3500
-# 忽略 Telegram 侧其它机器人发的消息
+# 忽略其它机器人发的消息
 ignore_telegram_bots = true
 
 # ── AI：直接调用宿主的主模型服务（Provider），全程不涉及 QQ ──

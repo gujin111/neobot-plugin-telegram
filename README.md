@@ -13,6 +13,17 @@ Telegram 用户 → 插件收消息 → 宿主的主模型服务（provider）�
 - 目标宿主：NeoBot **v2.1.0a16**（同时验证 2.0.1 / a9 / a7）
 - 只依赖宿主已有的 `httpx` / `pydantic`
 
+## 代码结构（4 个文件）
+
+| 文件 | 职责 |
+| --- | --- |
+| [`__init__.py`](__init__.py) | 插件定义、配置、生命周期、两条命令、AI 对话编排 |
+| [`tg_api.py`](tg_api.py) | Bot API 客户端与长轮询（重试 / 429 / 请求头） |
+| [`tg_model.py`](tg_model.py) | Update 解码：拍平成事件对象 |
+| [`tg_send.py`](tg_send.py) | 出站文本：HTML 转义 + 分段 |
+
+三个 `tg_*.py` 不 import 任何 NeoBot 模块，可以单独测；`extras/` 只有自建反代用的 Worker 与说明。
+
 ## 它是怎么回话的
 
 宿主的模型配置在面板里（`[models]`），运行时注册成 `provider` 服务，接口是：
@@ -44,7 +55,7 @@ endpoint = "https://api.telegram.org"        # 反代留空时才用
 reverse_proxy_url = "https://tg.gujin99.xyz" # 清空它 → 走 endpoint / proxy
 reverse_proxy_secret = "v1-a5e68cb17320"     # 路径密钥
 proxy_key = "pk-a5e68cb17320"                # 请求头密钥（X-Proxy-Key），不匹配 403
-proxy = ""                                    # 也可写 http://… / socks5://… / auto
+proxy = ""                                    # 也可写 http://127.0.0.1:7890（SOCKS 用其 HTTP 端口）
 ```
 
 > 内置反代做了两道校验：URL 里的路径密钥 + 请求头 `X-Proxy-Key`。
@@ -57,7 +68,7 @@ proxy = ""                                    # 也可写 http://… / socks5://
 | `enabled` | `true` | 总开关 |
 | `endpoint` | `https://api.telegram.org` | 直连地址 |
 | `reverse_proxy_url` / `reverse_proxy_secret` | 空 | 反代基址与路径密钥，优先级高于 `endpoint` |
-| `proxy` | 空 | `http://…` / `socks5://…`（内置握手）/ `auto`（自动探测宿主端口） |
+| `proxy` | 空 | http(s) 代理，例如 `http://127.0.0.1:7890`（SOCKS 请用代理软件的 HTTP 端口） |
 | `polling_timeout` / `retry_times` / `retry_interval` | 25 / 6 / 5.0 | 长轮询与重连 |
 | `allowed_updates` | 空=全部 | 留空即包含 `chat_member` |
 | `parse_mode` / `link_preview` / `chunk_size` | html / true / 3500 | 出站渲染 |
@@ -89,11 +100,13 @@ proxy = ""                                    # 也可写 http://… / socks5://
 
 | 情况 | 怎么配 |
 | --- | --- |
-| 有代理软件 | `proxy = "http://127.0.0.1:7890"`（同机）；容器里用宿主地址或 `proxy = "auto"` |
+| 有代理软件 | `proxy = "http://127.0.0.1:7890"`（同机）；容器里填宿主的局域网地址 |
 | 有域名 | 按 [`extras/README.md`](extras/README.md) 部署 Worker，填 `reverse_proxy_url` + `reverse_proxy_secret` |
-| 服务器能直连 | 两个都留空 |
+| 服务器能直连 | 把 `reverse_proxy_url` 清空 |
 
-`socks5://` 由插件内置实现（[tg_proxy.py](tg_proxy.py)），**不需要 `socksio`**。
+> 自带 SOCKS5 客户端已移除（3.0.0 精简）：`proxy` 直接交给 httpx，
+> 所以只支持 `http://` / `https://` 代理。Clash / mihomo / sing-box 都同时提供 HTTP 端口
+> （Clash 的 `mixed-port` 默认 7890），填它即可；纯 SOCKS 端口请先打开 HTTP 监听。
 
 ## 与 Koishi 原版的差异
 
@@ -102,9 +115,10 @@ proxy = ""                                    # 也可写 http://… / socks5://
 | 长轮询 / 自动摘 webhook / 退避重连 | ✅ | ✅ |
 | `allowed_updates` | 探活传空列表 → 收不到 `chat_member` | ✅ 默认含全集 |
 | 429 限流 | 按重试间隔 | ✅ 读 `retry_after` |
-| 实体解析 / 相册聚合 | ✅ | ✅（相册不阻塞轮询） |
-| 超长文本 | 直接报错 | ✅ 标签安全分段 |
-| 纯按钮消息 | 漏发 | ✅ 会发 |
+| 实体解析 / 富文本还原 | ✅ | ❌ 只取纯文本交给模型 |
+| 相册聚合 | ✅ | ❌ 每条独立处理（都变成占位文本） |
+| 超长文本 | 直接报错 | ✅ 按段落安全分段 |
+| 媒体/按钮发送 | ✅ | ❌ 只发文本（AI 回复用不到） |
 | `entities: []` | 抛 TypeError | ✅ 安全 |
 | Webhook | ✅ | ❌ 未实现（插件拿不到宿主入站路由） |
 | QQ 相关 | — | ❌ 完全不做（2.1.0 起彻底移除） |
@@ -115,7 +129,7 @@ proxy = ""                                    # 也可写 http://… / socks5://
 cd neobot-plugin-telegram
 export PYTHONPATH=<NeoBot>/packages/modloader/src:<NeoBot>/packages/contracts/src:<NeoBot>/packages/adapter/src
 
-python -m pytest tests -q          # 59 项
+python -m pytest tests -q          # 46 项
 python devtools/simulate.py        # 宿主模拟器：命令页 + 独立 TG 对话 + 上下文
 python tools/check_compat.py --ref <宿主根目录>
 python -m neobot_modloader.sdk check .   # 2.1.0a15+ 才有

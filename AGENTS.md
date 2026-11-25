@@ -16,14 +16,14 @@
 
 | 文件 | 职责 |
 | --- | --- |
-| `__init__.py` | Plugin、配置、生命周期、命令（只两条）、入站分发、AI 直答编排 |
-| `tg_api.py` | Bot API 客户端：endpoint/代理/重试/429/长轮询/文件（**零宿主依赖**） |
-| `tg_model.py` | Update 解码：实体、媒体、相册聚合（**零宿主依赖**） |
-| `tg_send.py` | 出站渲染：HTML 转义、标签安全分段、媒体映射、按钮（**零宿主依赖**） |
-| `tg_proxy.py` | 内置 SOCKS5 + 本地 CONNECT 网关 + `auto` 探测（**只依赖标准库**） |
+| `__init__.py` | Plugin、配置、生命周期、命令（只两条）、入站分发、AI 对话编排 |
+| `tg_api.py` | Bot API 客户端与长轮询：重试/429/请求头（**零宿主依赖**） |
+| `tg_model.py` | Update 解码：拍平成事件对象（**零宿主依赖**） |
+| `tg_send.py` | 出站文本：HTML 转义 + 分段（**零宿主依赖**） |
 
-`tg_*` 四个模块不 import 任何 NeoBot 模块；只有 `__init__.py` 依赖宿主，导入写成
+`tg_*` 三个模块不 import 任何 NeoBot 模块；只有 `__init__.py` 依赖宿主，导入写成
 「包导入 / 顶层导入」双分支（pytest 收集会把插件根目录当模块导入一次）。
+刻意不做的事：实体/相册解析、媒体与按钮发送、内置 SOCKS5、Webhook——需要时再加回来。
 
 ## 必须遵守的行为约定
 
@@ -31,7 +31,7 @@
 2. **上下文自己管**：`_history[chat_id]` 保留 `history_limit * 2` 条（user+assistant 成对），
    超了从头裁；`history_limit=0` 表示不带历史。
 3. **等待要有上限**：`asyncio.wait_for(provider.chat(...), ai_timeout)`；
-   超时/异常/空回复都要降级成 `ai_error_reply` 并计 `ai_failures`。
+   超时/异常/空回复都要降级成 `ai_error_reply` 并计 `failures`。
 4. **配置值先清洗**：所有字符串配置走 `strip_wrapping_quotes`（粘贴常带引号），
    反代/endpoint 缺协议头时按 `https://` 补全。
 5. **密钥打码**：`/tg状态`、`/tg诊断`、日志里 token 与 `reverse_proxy_secret` 一律不能出现明文。
@@ -41,7 +41,7 @@
 ## 提交前
 
 ```bash
-# 单元测试（59 项，建议至少跑 a16 与 2.0.1）
+# 单元测试（46 项，建议至少跑 a16 与 2.0.1）
 PYTHONPATH=<NeoBot>/packages/modloader/src:<NeoBot>/packages/contracts/src:<NeoBot>/packages/adapter/src \
   python -m pytest tests -q
 

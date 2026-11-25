@@ -17,22 +17,6 @@
         "title": "Ai Timeout",
         "type": "number"
       },
-      "allowed_updates": {
-        "description": "只接收这些类型的更新；留空 = 全部（含 chat_member）",
-        "items": {
-          "type": "string"
-        },
-        "title": "Allowed Updates",
-        "type": "array"
-      },
-      "chunk_size": {
-        "default": 3500,
-        "description": "长文本自动分段长度上限",
-        "maximum": 4096,
-        "minimum": 200,
-        "title": "Chunk Size",
-        "type": "integer"
-      },
       "enabled": {
         "default": true,
         "description": "总开关；关闭后不连 Telegram（命令仍可用）",
@@ -47,7 +31,7 @@
       },
       "history_limit": {
         "default": 12,
-        "description": "每个 TG 会话保留的历史消息条数（0 = 无上下文）",
+        "description": "每个 TG 会话保留的历史条数（0 = 无上下文）",
         "maximum": 100,
         "minimum": 0,
         "title": "History Limit",
@@ -59,22 +43,6 @@
         "title": "Ignore Telegram Bots",
         "type": "boolean"
       },
-      "link_preview": {
-        "default": true,
-        "description": "发送链接时展示网页预览",
-        "title": "Link Preview",
-        "type": "boolean"
-      },
-      "parse_mode": {
-        "default": "html",
-        "description": "发送时使用的解析格式",
-        "enum": [
-          "html",
-          "none"
-        ],
-        "title": "Parse Mode",
-        "type": "string"
-      },
       "polling_timeout": {
         "default": 25,
         "description": "长轮询单次等待秒数",
@@ -83,57 +51,47 @@
         "title": "Polling Timeout",
         "type": "integer"
       },
-      "protocol": {
-        "default": "polling",
-        "description": "通信方式；当前只实现 polling",
-        "enum": [
-          "polling",
-          "webhook"
-        ],
-        "title": "Protocol",
-        "type": "string"
-      },
       "proxy": {
         "default": "",
-        "description": "网络代理：http://…、socks5://…（内置实现，不需要 socksio），或 auto 自动探测",
+        "description": "http(s) 代理，如 http://127.0.0.1:7890；SOCKS 请用其 HTTP 端口",
         "title": "Proxy",
         "type": "string"
       },
       "proxy_key": {
         "default": "pk-a5e68cb17320",
-        "description": "反代请求头密钥 X-Proxy-Key；与 Worker 的 PROXY_KEY 一致，自建反代时改成自己的",
+        "description": "反代请求头密钥 X-Proxy-Key，与 Worker 的 PROXY_KEY 一致",
         "title": "Proxy Key",
         "type": "string"
       },
       "retry_interval": {
         "default": 5.0,
-        "description": "断开后的重试间隔（秒）",
+        "description": "失败重试间隔（秒）",
         "minimum": 0.5,
         "title": "Retry Interval",
         "type": "number"
       },
       "retry_times": {
         "default": 6,
-        "description": "初次连接失败的最大重试次数",
+        "description": "连续失败多少次后放弃（0 = 一直重试）",
         "minimum": 0,
         "title": "Retry Times",
         "type": "integer"
       },
       "reverse_proxy_secret": {
-        "description": "内置反代的路径密钥；换成自己的反代时改成自己的密钥",
+        "description": "反代路径密钥，与 Worker 的 PATH_SECRET 一致",
         "title": "Reverse Proxy Secret",
         "type": "string",
         "writeOnly": true
       },
       "reverse_proxy_url": {
         "default": "https://tg.gujin99.xyz",
-        "description": "默认走内置反代（只需填 token 即可用）；留空则改用 endpoint / proxy 直连",
+        "description": "默认走内置反代（只填 token 即可用）；留空则改用 endpoint / proxy 直连",
         "title": "Reverse Proxy Url",
         "type": "string"
       },
       "system_prompt": {
         "default": "你是 NeoBot，一个友好的聊天助手。用简短自然的方式回答。",
-        "description": "系统提示词（人格设定），每个 TG 会话都在此基础上对话",
+        "description": "系统提示词（人格）",
         "title": "System Prompt",
         "type": "string"
       },
@@ -149,9 +107,9 @@
   },
   "guides": [],
   "plugin": {
-    "description": "Telegram 独立 Bot：只填 token 即可用（内置反代 + 请求头校验），不涉及 QQ",
+    "description": "Telegram 独立 Bot：只填 token 即可用（内置反代），AI 由宿主模型驱动",
     "name": "telegram",
-    "version": "2.3.0"
+    "version": "3.0.0"
   },
   "resources": [],
   "schema_version": 1
