@@ -30,7 +30,7 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from neobot_modloader import MessageChain, Plugin
 
@@ -84,10 +84,35 @@ except ImportError:  # pragma: no cover - 顶层模块加载（pytest 收集 / �
 # ── 配置 ─────────────────────────────────────────────────────────────
 
 
+def strip_wrapping_quotes(value: object) -> str:
+    """去掉粘贴时带进来的包裹果引号（``"https://…"`` → ``https://…``）。
+
+    面板/文档里复制配置时很常见：值本身被一对引号包着，或者只有开头那一半。
+    URL / token / 密钥都不会以引号开头或结尾，所以这里可以放心剥。
+    """
+    text = str(value or "").strip()
+    changed = True
+    while changed and text:
+        changed = False
+        for quote in ('"', "'", "`"):
+            if text.startswith(quote):
+                text = text[1:].lstrip()
+                changed = True
+            if text.endswith(quote):
+                text = text[:-1].rstrip()
+                changed = True
+    return text
+
+
 class Config(BaseModel):
     """插件配置；运行值在 data/plugins_data/telegram/config.toml。"""
 
     model_config = ConfigDict(extra="allow")
+
+    @field_validator("token", "endpoint", "reverse_proxy_url", "reverse_proxy_secret", "proxy", mode="before")
+    @classmethod
+    def _clean_strings(cls, value: object) -> str:
+        return strip_wrapping_quotes(value)
 
     enabled: bool = Field(default=True, description="总开关；关闭后不连 Telegram（命令仍可用）")
     token: str = Field(default="", description="BotFather 发的机器人令牌：123456:ABC-DEF...")
@@ -132,7 +157,7 @@ class Config(BaseModel):
 
 
 _PLUGIN_KWARGS: dict[str, Any] = dict(
-    version="1.1.1",
+    version="1.1.2",
     description="Telegram 桥接：移植 Koishi Telegram 适配器（长轮询 + QQ 双向互通）",
     usage="发送 @机器人 /tg 查看状态；/tg绑定 建立互通（/help 可查全部命令与别名）",
     author="NeoBot 第三方插件",
@@ -651,14 +676,18 @@ def _resolve_endpoint(config: Config) -> tuple[str, str]:
     """算出实际使用的 API 基址，返回 (基址, 来源)。
 
     优先级：``reverse_proxy_url``（+ ``reverse_proxy_secret``）> ``endpoint`` > 官方地址。
-    反代基址与密钥都会做斜杠归一化，避免拼出 ``//`` 或 ``/secret/bot`` 这类怪路径。
+    容错：去掉粘贴带来的引号；缺 ``http(s)://`` 时按 https 补全；反代基址与密钥做斜杠归一化。
     """
-    reverse = (config.reverse_proxy_url or "").strip().rstrip("/")
+    reverse = strip_wrapping_quotes(config.reverse_proxy_url).rstrip("/")
     if reverse:
-        secret = (config.reverse_proxy_secret or "").strip().strip("/")
+        if not reverse.startswith(("http://", "https://")):
+            reverse = "https://" + reverse
+        secret = strip_wrapping_quotes(config.reverse_proxy_secret).strip("/")
         return (f"{reverse}/{secret}" if secret else reverse), "reverse_proxy"
-    endpoint = (config.endpoint or "").strip().rstrip("/")
+    endpoint = strip_wrapping_quotes(config.endpoint).rstrip("/")
     if endpoint and endpoint != DEFAULT_ENDPOINT.rstrip("/"):
+        if not endpoint.startswith(("http://", "https://")):
+            endpoint = "https://" + endpoint
         return endpoint, "config"
     return DEFAULT_ENDPOINT.rstrip("/"), "default"
 

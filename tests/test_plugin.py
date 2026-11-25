@@ -550,10 +550,26 @@ def test_resolve_endpoint_priority_and_normalization(scratch):
             {"reverse_proxy_url": "https://w.example", "endpoint": "https://ignored.example"},
             ("https://w.example", "reverse_proxy"),
         ),
+        # 粘贴带来的引号（成对 / 只有开头 / 反引号）都要能剥掉
+        ({"reverse_proxy_url": '"https://w.example"'}, ("https://w.example", "reverse_proxy")),
+        ({"reverse_proxy_url": '"https://w.example'}, ("https://w.example", "reverse_proxy")),
+        ({"reverse_proxy_url": "`https://w.example`"}, ("https://w.example", "reverse_proxy")),
+        # 缺协议头时按 https 补全（用户常见手误）
+        ({"reverse_proxy_url": "w.example"}, ("https://w.example", "reverse_proxy")),
+        ({"endpoint": "tg.example"}, ("https://tg.example", "config")),
     ]
     for raw, expected in cases:
         config = module.Config.model_validate(raw)
         assert module._resolve_endpoint(config) == expected, raw
+
+
+def test_config_strips_quotes_from_token_and_proxy(scratch):
+    module = load_plugin()
+    config = module.Config.model_validate(
+        {"token": '"123456:abc"', "proxy": '"http://127.0.0.1:7890/"'}
+    )
+    assert config.token == "123456:abc"
+    assert config.proxy == "http://127.0.0.1:7890/"
 
 
 def test_diag_and_hint_mask_reverse_proxy_secret(scratch):

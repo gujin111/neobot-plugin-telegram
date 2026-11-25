@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.1.2
+
+修「配置里多带了一个引号 / 漏了协议头」导致反代连不上。
+
+现象：
+
+```
+TelegramTransportError: ... UnsupportedProtocol: Request URL is missing an 'http://' or 'https://' protocol.
+```
+
+`/tg状态` 里能看到终结点是 `"https://…`（开头多一个引号）——因为粘贴配置时把引号
+一起带进了值里。
+
+### 修复
+
+- `token` / `endpoint` / `reverse_proxy_url` / `reverse_proxy_secret` / `proxy` 统一做清理：
+  自动剥掉包裹用的 `"` / `'` / `` ` ``（支持成对、只带一半、多层嵌套），再去首尾空白。
+- 反代与自定义 endpoint 缺少 `http(s)://` 时按 `https://` 补全（例如只写了 `w.example`），
+  不再直接报协议错误。
+- 顺带：`/tg状态`、`/tg诊断` 里展示的就是清理后的地址。
+
+### 验证
+
+pytest 72/72（新增：成对/单边/反引号引号、缺协议头补全、token 与 proxy 的清理）；
+`devtools/simulate.py` 通过；干净副本 `sdk check` 通过；契约导出 1.1.2。
+
 ## 1.1.1
 
 修「容器里解析不了 `host.docker.internal`」这类报错的可操作性。
