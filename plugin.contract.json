@@ -4,43 +4,15 @@
     "additionalProperties": true,
     "description": "插件配置；运行值在 data/plugins_data/telegram/config.toml。",
     "properties": {
-      "ai_channel": {
-        "default": "",
-        "description": "AI 工作区所在通道：onebot / official；留空让宿主自动判断",
-        "title": "Ai Channel",
-        "type": "string"
-      },
-      "ai_endpoint_id": {
-        "default": "",
-        "description": "AI 工作区 ID：填一个 QQ 号（私聊）或群号（群聊）。AI 在这里生成回复，宿主也会把回复发到这里",
-        "title": "Ai Endpoint Id",
-        "type": "string"
-      },
-      "ai_endpoint_kind": {
-        "default": "private",
-        "description": "AI 工作区类型：私聊或群聊（对应宿主的 kind）",
-        "enum": [
-          "private",
-          "group"
-        ],
-        "title": "Ai Endpoint Kind",
-        "type": "string"
-      },
       "ai_error_reply": {
         "default": "（AI 暂时没有响应，请稍后再试）",
-        "description": "AI 没产出时回给 TG 用户的文案，留空则不回复",
+        "description": "模型失败时回给用户的文案；留空则不回复",
         "title": "Ai Error Reply",
         "type": "string"
       },
-      "ai_prefix": {
-        "default": "[TG {name}] ",
-        "description": "交给 AI 时给消息加的前缀，支持 {name} {chat} {id}",
-        "title": "Ai Prefix",
-        "type": "string"
-      },
       "ai_timeout": {
-        "default": 90.0,
-        "description": "等待 AI 生成回复的超时（秒）",
+        "default": 120.0,
+        "description": "单次模型调用超时（秒）",
         "minimum": 5.0,
         "title": "Ai Timeout",
         "type": "number"
@@ -72,6 +44,14 @@
         "description": "Bot API 终结点；直连不通时改为反代地址",
         "title": "Endpoint",
         "type": "string"
+      },
+      "history_limit": {
+        "default": 12,
+        "description": "每个 TG 会话保留的历史消息条数（0 = 无上下文）",
+        "maximum": 100,
+        "minimum": 0,
+        "title": "History Limit",
+        "type": "integer"
       },
       "ignore_telegram_bots": {
         "default": true,
@@ -145,6 +125,12 @@
         "title": "Reverse Proxy Url",
         "type": "string"
       },
+      "system_prompt": {
+        "default": "你是 NeoBot，一个友好的聊天助手。用简短自然的方式回答。",
+        "description": "系统提示词（人格设定），每个 TG 会话都在此基础上对话",
+        "title": "System Prompt",
+        "type": "string"
+      },
       "token": {
         "description": "BotFather 发的机器人令牌：123456:ABC-DEF...",
         "title": "Token",
@@ -157,9 +143,9 @@
   },
   "guides": [],
   "plugin": {
-    "description": "Telegram 直连 AI：TG 用户直接和 NeoBot 对话（只保留状态查询命令）",
+    "description": "Telegram 独立 Bot：TG 用户直接和 NeoBot 的 AI 对话（不涉及 QQ）",
     "name": "telegram",
-    "version": "2.0.0"
+    "version": "2.1.0"
   },
   "resources": [],
   "schema_version": 1

@@ -1,36 +1,39 @@
-# telegram — 让 NeoBot 在 Telegram 里和用户对话
+# telegram — 让 NeoBot 在 Telegram 里当个独立 Bot
 
-把 Koishi 的 [`@koishijs/plugin-adapter-telegram`](https://github.com/satorijs/satori/tree/main/adapters/telegram)
-的协议能力移植到 [NeoBot](https://github.com/SuperQuail/NeoBot) 上，做成**纯 Telegram 前端**：
+纯 Telegram 前端：**TG 用户直接和 AI 聊天，整个链路不涉及任何 QQ 会话**。
 
 ```
-Telegram 用户 → 插件收消息 → 宿主 AI 生成 → 文本发回 Telegram
+Telegram 用户 → 插件收消息 → 宿主的主模型服务（provider）→ 文本发回 Telegram
 ```
 
-- **不再有任何 QQ 桥接**（2.0.0 起移除），命令只保留状态查询
-- 目标宿主：**NeoBot v2.1.0a16**（同时验证 2.0.1 / a9 / a8 / a7）
-- 不改 NeoBot 本体，只用 `neobot_modloader` 公开 API
+- 不经过宿主的 QQ 回复管线，不需要 QQ 群/号，不往 QQ 发任何东西
+- 上下文由插件按 **TG 会话**自己维护（内存，默认 12 条）
+- 命令只保留状态查询：`/tg`、`/tg诊断`
+- 目标宿主：NeoBot **v2.1.0a16**（同时验证 2.0.1 / a9 / a7）
 - 只依赖宿主已有的 `httpx` / `pydantic`
 
-## 它怎么把消息变成 AI 回复
+## 它是怎么回话的
 
-NeoBot 的回复管线以「会话」为单位，插件通过宿主服务
-`reply_orchestrator.start_background_reply(...)` 把一条内容推进管线，然后读回
-`ReplyEvent.generated_text`（AI 生成的原文），再发回 Telegram。
+宿主的模型配置在面板里（`[models]`），运行时注册成 `provider` 服务，接口是：
 
-所以需要一个 **AI 工作区**：一个 QQ 群或私聊，AI 在那里生成回复。
+```python
+async def chat(messages: list[dict], tools=None) -> dict   # {"role": "assistant", "content": "..."}
+```
 
-> ⚠️ 宿主会把 AI 的回复**也发到这个 QQ 工作区**（出站发送由宿主掌控，插件拦不住）。
-> 建议填你自己一个小号/小群，别用主群。多个 Telegram 会话会共用同一个工作区，
-> 上下文会混在一起——单人自用没问题。
+插件做的事就是：`system_prompt` + 该 TG 会话的历史 + 当前消息 → `provider.chat(...)` → 把 `content` 发回 TG。
+所以**模型用的是你在 NeoBot 里配的那个**，不用另填 API Key。
 
 ## 配置
 
 ```toml
 # 必填
 token = "123456:ABC-DEF..."          # BotFather 给的
-ai_endpoint_kind = "private"         # private 私聊 / group 群聊
-ai_endpoint_id = "10001"             # 对应 QQ 号（私聊）或群号（群聊）
+
+# 可选：人格与上下文
+system_prompt = "你是 NeoBot，一个友好的聊天助手。用简短自然的方式回答。"
+history_limit = 12                    # 每个 TG 会话保留几条历史（0 = 无上下文）
+ai_timeout = 120.0                    # 单次模型调用超时（秒）
+ai_error_reply = "（AI 暂时没有响应，请稍后再试）"
 
 # 网络（国内通常必填其一）
 reverse_proxy_url = "https://tg.你的域名"   # 反代，推荐
@@ -38,12 +41,11 @@ reverse_proxy_secret = "v1-xxxxxxxx"        # 与 Worker 的 PATH_SECRET 一致
 proxy = ""                                   # 用反代时留空；也可写 http://… / socks5://… / auto
 ```
 
-完整配置项：
+其余配置项：
 
 | 配置 | 默认 | 说明 |
 | --- | --- | --- |
 | `enabled` | `true` | 总开关 |
-| `token` | 空 | 机器人令牌 |
 | `endpoint` | `https://api.telegram.org` | 直连地址 |
 | `reverse_proxy_url` / `reverse_proxy_secret` | 空 | 反代基址与路径密钥，优先级高于 `endpoint` |
 | `proxy` | 空 | `http://…` / `socks5://…`（内置握手）/ `auto`（自动探测宿主端口） |
@@ -51,20 +53,15 @@ proxy = ""                                   # 用反代时留空；也可写 ht
 | `allowed_updates` | 空=全部 | 留空即包含 `chat_member` |
 | `parse_mode` / `link_preview` / `chunk_size` | html / true / 3500 | 出站渲染 |
 | `ignore_telegram_bots` | `true` | 忽略其它机器人 |
-| `ai_endpoint_kind` / `ai_endpoint_id` | private / 空 | AI 工作区（见上） |
-| `ai_channel` | 空 | `onebot` / `official`，留空让宿主判断 |
-| `ai_prefix` | `[TG {name}] ` | 交给 AI 时的前缀，支持 `{name}` `{chat}` `{id}` |
-| `ai_timeout` | 90 | 等 AI 生成的超时（秒） |
-| `ai_error_reply` | `（AI 暂时没有响应…）` | 没产出时回给用户的文案，留空则不回 |
 
 ## 命令（只有两条）
 
 | 命令 | 别名 | 说明 |
 | --- | --- | --- |
-| `/tg` | `telegram`、`电报` | 运行状态：连接、终结点、代理、AI 工作区、计数器 |
-| `/tg诊断` | `tgdiag`、`电报诊断` | 链路诊断：token 打码、反代/代理、轮询统计、编排器可用性、真实 `getMe` 探测 |
+| `/tg` | `telegram`、`电报` | 运行状态：连接、终结点、代理、模型服务、上下文与计数器 |
+| `/tg诊断` | `tgdiag`、`电报诊断` | 链路诊断：token 打码、反代/代理、轮询统计、`provider` 可用性、真实 `getMe` 探测 |
 
-重连是自动的：启动失败会每 `max(15s, retry_interval×3)` 复检，连通后自动接上轮询，不需要手动命令。
+重连是自动的：启动失败会每 `max(15s, retry_interval×3)` 复检，连通后自动接上轮询。
 
 ## 安装
 
@@ -75,8 +72,9 @@ proxy = ""                                   # 用反代时留空；也可写 ht
    ```
 
 2. 重启 NeoBot，或在面板「插件管理」里加载；
-3. 面板「插件 → 配置 → telegram」填 `token`、`ai_endpoint_id`，以及网络（反代或代理）；
-4. 在 Telegram 里给机器人发一句话，应该能收到 AI 的回复。
+3. 面板「插件 → 配置 → telegram」填 `token` 与网络（反代或代理）；
+4. **确认 NeoBot 自己的模型已配好**（面板「模型」里能正常对话），否则插件会提示没有可用的 provider；
+5. 在 Telegram 里给机器人发一句话。
 
 ## 网络：连不上 api.telegram.org 怎么办
 
@@ -86,8 +84,7 @@ proxy = ""                                   # 用反代时留空；也可写 ht
 | 有域名 | 按 [`extras/README.md`](extras/README.md) 部署 Worker，填 `reverse_proxy_url` + `reverse_proxy_secret` |
 | 服务器能直连 | 两个都留空 |
 
-`socks5://` 由插件内置实现（[tg_proxy.py](tg_proxy.py)），**不需要 `socksio`**：插件在 `127.0.0.1`
-起一个随机端口的 CONNECT 隧道交给 httpx，用完即关。
+`socks5://` 由插件内置实现（[tg_proxy.py](tg_proxy.py)），**不需要 `socksio`**。
 
 ## 与 Koishi 原版的差异
 
@@ -101,7 +98,7 @@ proxy = ""                                   # 用反代时留空；也可写 ht
 | 纯按钮消息 | 漏发 | ✅ 会发 |
 | `entities: []` | 抛 TypeError | ✅ 安全 |
 | Webhook | ✅ | ❌ 未实现（插件拿不到宿主入站路由） |
-| QQ 桥接 | — | ❌ 2.0.0 起移除（改为 TG 直连 AI） |
+| QQ 相关 | — | ❌ 完全不做（2.1.0 起彻底移除） |
 
 ## 验证
 
@@ -109,19 +106,20 @@ proxy = ""                                   # 用反代时留空；也可写 ht
 cd neobot-plugin-telegram
 export PYTHONPATH=<NeoBot>/packages/modloader/src:<NeoBot>/packages/contracts/src:<NeoBot>/packages/adapter/src
 
-python -m pytest tests -q          # 57 项
-python devtools/simulate.py        # 宿主模拟器：命令页 + AI 直答链路
+python -m pytest tests -q          # 59 项
+python devtools/simulate.py        # 宿主模拟器：命令页 + 独立 TG 对话 + 上下文
 python tools/check_compat.py --ref <宿主根目录>
 python -m neobot_modloader.sdk check .   # 2.1.0a15+ 才有
 ```
 
 ## 已知限制
 
-1. **AI 回复会同时出现在 QQ 工作区**（宿主行为），所以工作区别用主群；
-2. **多个 TG 会话共用同一个工作区**，AI 上下文是混的（建议单人/小范围使用）；
-3. 同一 TG 会话内消息**串行**处理（插件加锁），并对宿主返回 `None`（已有回复在进行）计数 `ai_busy`；
-4. Webhook 未实现，只做长轮询；
-5. Telegram 侧无法 @ QQ 用户（没有 ID 映射，也不需要了）。
+1. **不带宿主的工具/技能/人格/记忆**：只借用模型本身，`system_prompt` 由你写；
+2. **上下文在内存里**：重启即清空，且每个 TG 会话（私聊按用户、群聊按群）一份；
+3. 群聊里所有成员共用同一个上下文；
+4. 同一会话串行处理（插件加锁），模型慢时会排队；
+5. Webhook 未实现，只做长轮询；
+6. 只发文本（图片/文件等媒体入站会被转成 `[photo]` 之类的占位文本）。
 
 ## 许可
 

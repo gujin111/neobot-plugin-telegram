@@ -1,13 +1,14 @@
 # AGENTS.md — telegram 插件
 
-给开发助手的最小上下文：NeoBot 2.x 的第三方插件，把 Telegram 做成 NeoBot 的**对话前端**
-（TG 用户直接和宿主 AI 聊天）。**不涉及 QQ 桥接**——2.0.0 起已移除。
+给开发助手的最小上下文：NeoBot 2.x 的第三方插件，把 Telegram 做成 **NeoBot 的独立对话前端**
+（TG 用户直接和 AI 聊天）。**完全不涉及 QQ**——2.1.0 起连模型调用都不经过 QQ。
 
 ## 边界（不要越界）
 
 - **不修改 NeoBot 本体**，只用 `neobot_modloader` 公开 API。
-- **不自己实现 AI**：回复必须走宿主的 `reply_orchestrator.start_background_reply(...)`，
-  文本从返回的 `ReplyEvent.generated_text` 读，不要自己拼提示词或直连模型。
+- **AI 只借宿主的模型服务**：调用 `ctx.services.get("provider").chat(messages)`，
+  接口是 `async chat(messages: list[dict], tools=None) -> dict`。**不要**走
+  `reply_orchestrator.start_background_reply`——那条路以 QQ 会话为单位，会把回复发到 QQ。
 - **不要试图注册新通道**：宿主 `adapter` 是 `__host__` 服务，插件覆盖不了。
 - Telegram 的网络调用只走 `tg_api.TelegramAPI`（代理、重试、429 都在那里）。
 
@@ -26,20 +27,21 @@
 
 ## 必须遵守的行为约定
 
-1. **同一个 TG 会话串行**：`reply_with_ai` 用每会话 `asyncio.Lock`；宿主返回 `None`
-   （该工作区已有管线在跑）时计 `ai_busy` 并返回空，不要重试轰炸宿主。
-2. **等待要有上限**：轮询 `generated_text` 直到 `ai_timeout` 或状态终态
-   （`COMPLETED`/`FAILED`/`CANCELLED`）。
-3. **配置值先清洗**：所有字符串配置走 `strip_wrapping_quotes`（粘贴常带引号），
+1. **同一个 TG 会话串行**：`reply_with_ai` 用每会话 `asyncio.Lock`，别并发打模型。
+2. **上下文自己管**：`_history[chat_id]` 保留 `history_limit * 2` 条（user+assistant 成对），
+   超了从头裁；`history_limit=0` 表示不带历史。
+3. **等待要有上限**：`asyncio.wait_for(provider.chat(...), ai_timeout)`；
+   超时/异常/空回复都要降级成 `ai_error_reply` 并计 `ai_failures`。
+4. **配置值先清洗**：所有字符串配置走 `strip_wrapping_quotes`（粘贴常带引号），
    反代/endpoint 缺协议头时按 `https://` 补全。
-4. **密钥打码**：`/tg状态`、`/tg诊断`、日志里 token 与 `reverse_proxy_secret` 一律不能出现明文。
-5. **能力探测一律 getattr**：`provides=`（a15+）、`ctx.services`、`ctx.app_commands` 在老宿主上可能不存在。
-6. **不要重新引入 QQ 桥接**：用户明确要求删掉；要加回来先确认。
+5. **密钥打码**：`/tg状态`、`/tg诊断`、日志里 token 与 `reverse_proxy_secret` 一律不能出现明文。
+6. **能力探测一律 getattr**：`provides=`（a15+）、`ctx.services`、`ctx.app_commands` 在老宿主上可能不存在。
+7. **不要重新引入 QQ**：用户明确要求"单独的 tgbot"；要加回来先确认。
 
 ## 提交前
 
 ```bash
-# 单元测试（57 项，建议至少跑 a16 与 2.0.1）
+# 单元测试（59 项，建议至少跑 a16 与 2.0.1）
 PYTHONPATH=<NeoBot>/packages/modloader/src:<NeoBot>/packages/contracts/src:<NeoBot>/packages/adapter/src \
   python -m pytest tests -q
 

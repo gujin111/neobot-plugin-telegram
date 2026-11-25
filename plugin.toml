@@ -1,6 +1,6 @@
 name = "telegram"
-version = "2.0.0"
-description = "Telegram 直连 AI：TG 用户直接和 NeoBot 对话（只保留状态查询命令）"
+version = "2.1.0"
+description = "Telegram 独立 Bot：TG 用户直接和 Neobot 的 AI 对话（不涉及 QQ）"
 author = "NeoBot 第三方插件"
 license = "MIT"
 tags = ["telegram", "im", "chat", "adapter"]
@@ -50,18 +50,14 @@ chunk_size = 3500
 # 忽略 Telegram 侧其它机器人发的消息
 ignore_telegram_bots = true
 
-# ── AI 接入：TG 消息交给宿主的回复管线生成，再把文本发回 TG ──
-# AI 工作区类型：private（私聊）/ group（群聊）
-ai_endpoint_kind = "private"
-# AI 工作区 ID：一个 QQ 号（私聊）或群号（群聊）。AI 在这里生成回复，宿主也会把回复发到这里
-ai_endpoint_id = ""
-# AI 工作区所在通道：onebot / official；留空让宿主自动判断
-ai_channel = ""
-# 交给 AI 时给消息加的前缀，支持 {name} {chat} {id}
-ai_prefix = "[TG {name}] "
-# 等待 AI 生成回复的超时（秒）
-ai_timeout = 90.0
-# AI 没产出时回给 TG 用户的文案；留空则不回复
+# ── AI：直接调用宿主的主模型服务（Provider），全程不涉及 QQ ──
+# 系统提示词（人格设定）
+system_prompt = "你是 NeoBot，一个友好的聊天助手。用简短自然的方式回答。"
+# 每个 TG 会话保留的历史消息条数（0 = 无上下文）
+history_limit = 12
+# 单次模型调用超时（秒）
+ai_timeout = 120.0
+# 模型失败时回给用户的文案；留空则不回复
 ai_error_reply = "（AI 暂时没有响应，请稍后再试）"
 
 [sdk]

@@ -1,12 +1,12 @@
-"""Telegram 直连 AI —— NeoBot 插件（2.0.0）。
+"""Telegram 独立 Bot —— NeoBot 插件（2.1.0）。
 
-Telegram 用户直接在 TG 里和 NeoBot 的 AI 对话：插件收 TG 消息 → 交给宿主回复管线生成 →
-把 `ReplyEvent.generated_text` 发回 TG。**不再有任何 QQ 桥接**，只保留状态查询命令。
+Telegram 用户直接在 TG 里和 AI 对话：插件收 TG 消息 → 直接调用宿主的主模型服务
+（``provider``，接口 ``async chat(messages) -> Message``）→ 把文本发回 TG。
+**全程不涉及任何 QQ 会话**：上下文由插件按 TG 会话自己维护。
 
-为什么需要「AI 端点」：NeoBot 的回复管线以会话为单位（kind + conversation_id），
-`reply_orchestrator.start_background_reply()` 是它对外暴露的程序化入口。所以插件要指定
-一个 QQ 群或私聊当"AI 工作区"——AI 会在这里生成回复（宿主也会把回复发到这里，
-这是宿主行为，插件拦不住）。对单人使用的机器人，填你自己的一个私聊/小群即可。
+为什么不用宿主的回复管线：那条管线以 QQ 会话（kind + conversation_id）为单位，
+需要指定一个 QQ 群/私聊当"工作区"，还会把 AI 的回复发到 QQ。独立 TG bot 不需要这些，
+所以这里只借用宿主的模型服务，其余全部在 Telegram 侧完成。
 
 模块：
     tg_api.py    Bot API 客户端（代理 / 反代 / 重试 / 长轮询 / 文件）
@@ -83,8 +83,7 @@ class Config(BaseModel):
         "reverse_proxy_url",
         "reverse_proxy_secret",
         "proxy",
-        "ai_endpoint_id",
-        "ai_channel",
+        "system_prompt",
         mode="before",
     )
     @classmethod
@@ -119,30 +118,23 @@ class Config(BaseModel):
     chunk_size: int = Field(default=3500, ge=200, le=4096, description="长文本自动分段长度上限")
     ignore_telegram_bots: bool = Field(default=True, description="忽略其它机器人发的消息")
 
-    # ── AI 接入 ──
-    ai_endpoint_kind: Literal["private", "group"] = Field(
-        default="private", description="AI 工作区类型：私聊或群聊（对应宿主的 kind）"
+    # ── AI（直接调宿主模型服务，和 QQ 完全无关） ──
+    system_prompt: str = Field(
+        default="你是 NeoBot，一个友好的聊天助手。用简短自然的方式回答。",
+        description="系统提示词（人格设定），每个 TG 会话都在此基础上对话",
     )
-    ai_endpoint_id: str = Field(
-        default="",
-        description="AI 工作区 ID：填一个 QQ 号（私聊）或群号（群聊）。AI 在这里生成回复，"
-        "宿主也会把回复发到这里",
+    history_limit: int = Field(
+        default=12, ge=0, le=100, description="每个 TG 会话保留的历史消息条数（0 = 无上下文）"
     )
-    ai_channel: str = Field(
-        default="", description="AI 工作区所在通道：onebot / official；留空让宿主自动判断"
-    )
-    ai_prefix: str = Field(
-        default="[TG {name}] ", description="交给 AI 时给消息加的前缀，支持 {name} {chat} {id}"
-    )
-    ai_timeout: float = Field(default=90.0, ge=5.0, description="等待 AI 生成回复的超时（秒）")
+    ai_timeout: float = Field(default=120.0, ge=5.0, description="单次模型调用超时（秒）")
     ai_error_reply: str = Field(
-        default="（AI 暂时没有响应，请稍后再试）", description="AI 没产出时回给 TG 用户的文案，留空则不回复"
+        default="（AI 暂时没有响应，请稍后再试）", description="模型失败时回给用户的文案；留空则不回复"
     )
 
 
 _PLUGIN_KWARGS: dict[str, Any] = dict(
-    version="2.0.0",
-    description="Telegram 直连 AI：TG 用户直接和 NeoBot 对话（只保留状态查询命令）",
+    version="2.1.0",
+    description="Telegram 独立 Bot：TG 用户直接和 NeoBot 的 AI 对话（不涉及 QQ）",
     usage="发送 /tg 查看状态；/tg诊断 做一次链路探测",
     author="NeoBot 第三方插件",
     config=Config,
@@ -184,15 +176,6 @@ def _mask_endpoint(endpoint: str, config: Config) -> str:
 def _source_label(source: str) -> str:
     return {"reverse_proxy": "反代", "config": "endpoint 配置", "default": "官方默认"}.get(source, source)
 
-
-def _fill(template: str, **fields: Any) -> str:
-    """填充模板，缺字段替换成空串（不抛 KeyError）。"""
-    if not template:
-        return ""
-    out = template
-    for key, value in fields.items():
-        out = out.replace("{" + key + "}", str(value or ""))
-    return out
 
 
 def _connection_hint(config: Config, error: str = "") -> str:
@@ -251,13 +234,13 @@ class TelegramRuntime:
             "messages": 0,
             "ai_replies": 0,
             "ai_failures": 0,
-            "ai_busy": 0,
             "dropped_bot": 0,
             "errors": 0,
         }
         self._flush_task: asyncio.Task[None] | None = None
         self._watchdog: asyncio.Task[None] | None = None
         self._locks: dict[str, asyncio.Lock] = {}
+        self._history: dict[str, list[dict[str, Any]]] = {}
 
     # ── 日志 ──
 
@@ -305,7 +288,7 @@ class TelegramRuntime:
             self.log(
                 "info",
                 f"Telegram 已连接：@{self.bot_username or self.me.get('id')}"
-                f"（id={self.me.get('id')}，AI 端点={self.ai_endpoint_label()}）",
+                f"（id={self.me.get('id')}，模型服务={self.ai_provider_label()}）",
             )
         except Exception as exc:  # noqa: BLE001 - 插件加载不能被网络问题打断
             self.state = "error"
@@ -463,43 +446,41 @@ class TelegramRuntime:
 
     # ── AI 对话 ──
 
-    def ai_endpoint_label(self) -> str:
-        if not self.config.ai_endpoint_id:
-            return "未配置"
-        kind = "群" if self.config.ai_endpoint_kind == "group" else "私聊"
-        return f"{kind} {self.config.ai_endpoint_id}"
+    def ai_provider_label(self) -> str:
+        return "宿主 provider（可用）" if self._provider() is not None else "宿主 provider（不可用）"
 
-    def _orchestrator(self) -> Any | None:
+    def _provider(self) -> Any | None:
+        """宿主的主模型服务（neobot_chat 的 Provider：async chat(messages) -> Message）。"""
         services = getattr(self.ctx, "services", None)
         if services is None:
             return None
         try:
-            return services.get("reply_orchestrator")
+            return services.get("provider")
         except Exception:  # noqa: BLE001 - 老宿主没有服务注册表
             return None
 
     def compose(self, event: IncomingEvent) -> str:
-        name = event.user_name or event.user_id or "?"
-        prefix = _fill(self.config.ai_prefix, name=name, chat=event.chat_title, id=event.user_id)
         body = event.caption or event.text
-        if not body:
-            kinds = "、".join(sorted({item.kind for item in event.media})) or "空消息"
-            body = f"[{kinds}]"
-        return f"{prefix}{body}"
+        if body:
+            return body
+        kinds = "、".join(sorted({item.kind for item in event.media})) or "空消息"
+        return f"[{kinds}]"
+
+    def _history_for(self, chat_id: str) -> list[dict[str, Any]]:
+        return self._history.setdefault(str(chat_id), [])
 
     async def reply_with_ai(self, event: IncomingEvent) -> None:
-        if not self.config.ai_endpoint_id:
+        if self._provider() is None:
+            self.counters["ai_failures"] += 1
             await self._safe_send(
                 event.chat_id,
-                "机器人已连上，但还没配置 AI 工作区：请在插件配置里填 ai_endpoint_kind 与 ai_endpoint_id"
-                "（一个 QQ 群号或 QQ 号）",
+                "宿主没有可用的模型服务（provider），暂时无法回复；请先在 NeoBot 面板里配置模型",
                 reply_to=event.message_id,
             )
             return
-        content = self.compose(event)
         lock = self._locks.setdefault(str(event.chat_id), asyncio.Lock())
         async with lock:
-            text = await self._ask_ai(content)
+            text = await self._ask_ai(str(event.chat_id), self.compose(event))
         if not text:
             self.counters["ai_failures"] += 1
             if self.config.ai_error_reply:
@@ -508,46 +489,44 @@ class TelegramRuntime:
         self.counters["ai_replies"] += 1
         await self._safe_send(event.chat_id, text, reply_to=event.message_id)
 
-    async def _ask_ai(self, content: str) -> str:
-        """把内容交给宿主回复管线，读回 AI 生成的文本。"""
-        orchestrator = self._orchestrator()
-        if orchestrator is None or not hasattr(orchestrator, "start_background_reply"):
-            self.log(
-                "warning",
-                "宿主没有 reply_orchestrator 服务，无法让 AI 回复；请确认 NeoBot 版本 ≥ 2.1.0",
-            )
+    async def _ask_ai(self, chat_id: str, user_text: str) -> str:
+        """直接调宿主模型服务：完全在 Telegram 侧完成，不经过任何 QQ 会话。"""
+        provider = self._provider()
+        if provider is None:
             return ""
+        history = self._history_for(chat_id)
+        messages: list[dict[str, Any]] = []
+        if self.config.system_prompt.strip():
+            messages.append({"role": "system", "content": self.config.system_prompt})
+        messages.extend(history)
+        messages.append({"role": "user", "content": user_text})
         try:
-            event = orchestrator.start_background_reply(
-                kind=self.config.ai_endpoint_kind,
-                conversation_id=str(self.config.ai_endpoint_id),
-                content=content,
-                manager_name="telegram",
-                channel=self.config.ai_channel or None,
-                proactive=True,
+            result = await asyncio.wait_for(
+                provider.chat(messages), timeout=float(self.config.ai_timeout)
             )
-        except Exception as exc:  # noqa: BLE001 - 宿主内部异常不该打爆插件
+        except asyncio.TimeoutError:
             self.counters["errors"] += 1
-            self.log("warning", f"启动 AI 回复失败：{type(exc).__name__}: {exc}")
+            self.log("warning", f"模型调用超时（{self.config.ai_timeout}s）")
             return ""
-        if event is None:
-            self.counters["ai_busy"] += 1
-            self.log("info", "AI 工作区已有回复在进行，稍后再试")
+        except Exception as exc:  # noqa: BLE001 - 模型侧异常不该打爆插件
+            self.counters["errors"] += 1
+            self.log("warning", f"模型调用失败：{type(exc).__name__}: {exc}")
             return ""
 
-        deadline = time.monotonic() + float(self.config.ai_timeout)
-        while time.monotonic() < deadline:
-            await asyncio.sleep(0.4)
-            text = str(getattr(event, "generated_text", "") or "").strip()
-            if text:
-                return text
-            state = getattr(event, "state", None)
-            if getattr(state, "name", "") in ("COMPLETED", "FAILED", "CANCELLED"):
-                break
-        text = str(getattr(event, "generated_text", "") or "").strip()
+        if isinstance(result, dict):
+            text = str(result.get("content") or "").strip()
+        else:
+            text = str(getattr(result, "content", "") or "").strip()
         if not text:
-            error = getattr(event, "error", None)
-            self.log("warning", f"AI 未产出回复（{getattr(getattr(event, 'state', None), 'name', '?')}）：{error}")
+            self.log("warning", "模型返回了空内容")
+            return ""
+
+        if self.config.history_limit > 0:
+            history.append({"role": "user", "content": user_text})
+            history.append({"role": "assistant", "content": text})
+            limit = int(self.config.history_limit) * 2
+            if len(history) > limit:
+                del history[: len(history) - limit]
         return text
 
     # ── 发送 ──
@@ -608,12 +587,12 @@ class TelegramRuntime:
     def status_text(self) -> str:
         endpoint, source = _resolve_endpoint(self.config)
         lines = [
-            "Telegram 直连 AI · 状态",
+            "Telegram 独立 Bot · 状态",
             f"· 运行状态：{self.state}",
             f"· 机器人：@{self.bot_username}" if self.bot_username else "· 机器人：未连接",
             f"· 终结点：{_mask_endpoint(endpoint, self.config)}（来源：{_source_label(source)}）",
             f"· 代理：{self._proxy_line()}",
-            f"· AI 工作区：{self.ai_endpoint_label()}",
+            f"· 模型服务：{self.ai_provider_label()}（上下文 {self.config.history_limit} 条/会话）",
             "· 计数器：" + "，".join(f"{key}={value}" for key, value in self.counters.items()),
         ]
         if self.last_error:
@@ -631,10 +610,9 @@ class TelegramRuntime:
             f"· endpoint：{_mask_endpoint(endpoint, self.config)}（来源：{_source_label(source)}）",
             f"· proxy：{self._proxy_line()}",
             f"· protocol：{self.config.protocol}（当前实际按 polling 运行）",
-            f"· AI 工作区：{self.ai_endpoint_label()}"
-            + (f"，通道={self.config.ai_channel}" if self.config.ai_channel else "，通道=自动"),
-            f"· AI 超时：{self.config.ai_timeout}s；前缀={self.config.ai_prefix!r}",
-            f"· 宿主编排器：{'可用' if self._orchestrator() is not None else '不可用'}",
+            f"· 模型服务：{self.ai_provider_label()}；超时={self.config.ai_timeout}s；"
+            f"上下文={self.config.history_limit} 条/会话",
+            f"· system_prompt：{len(self.config.system_prompt)} 字",
         ]
         if self.poller is not None:
             stats = self.poller.stats
@@ -703,7 +681,7 @@ def register_commands(ctx: Any, config: Config) -> None:
     )(run_status)
     registrar.register(
         "tg诊断",
-        description="Telegram 链路诊断：token / 反代 / 代理 / 轮询 / AI 工作区（别名：tgdiag）",
+        description="Telegram 链路诊断：token / 反代 / 代理 / 轮询 / 模型服务（别名：tgdiag）",
         usage="",
         permission=0,
         aliases=("tgdiag", "电报诊断"),
@@ -721,8 +699,7 @@ async def on_load(ctx: Any) -> None:
     runtime = _runtime(ctx, config)
     register_commands(ctx, config)
     ctx.logger.info(
-        f"[telegram] 已加载：AI 工作区={runtime.ai_endpoint_label()}"
-        f"{'' if config.ai_endpoint_id else '（未配置，TG 用户会收到提示）'}"
+        f"[telegram] 已加载：模型服务={runtime.ai_provider_label()}"
     )
 
 

@@ -1,4 +1,4 @@
-"""插件级用例：状态查询命令、AI 直答（用假编排器）、配置清理、链路诊断。
+"""插件级用例：状态命令、独立 TG 对话（直接调宿主 provider）、配置清理、诊断。
 
 需要 ``neobot_modloader``（PYTHONPATH 指向 NeoBot 的 packages/*/src），
 缺失时 ``_loader.load_plugin`` 会 skip。
@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import pathlib
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from _loader import load_plugin
 
@@ -90,8 +91,6 @@ class Context:
 
 
 class FakeAPI:
-    """替代 TelegramAPI：记录调用，可选返回固定结果。"""
-
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict]] = []
         self.answers: list[str] = []
@@ -114,32 +113,28 @@ class FakeAPI:
     def gateway_url(self) -> str:
         return ""
 
-    def sent_texts(self) -> list[str]:
-        return [params.get("text", "") for method, params in self.calls if method == "sendMessage"]
+    def last_text(self) -> str:
+        return self.calls[-1][1].get("text", "") if self.calls else ""
 
 
-class FakeEvent:
-    """冒充 ReplyEvent：只需要 generated_text / state / error。"""
+class FakeProvider:
+    """冒充宿主的 provider 服务：实现 async chat(messages) -> Message。"""
 
-    def __init__(self, text: str = "", state: str = "COMPLETED", error=None) -> None:
-        self.generated_text = text
-        self.state = SimpleNamespace(name=state)
+    def __init__(self, reply: str = "你好呀，我是 NeoBot", *, error: Exception | None = None) -> None:
+        self.reply = reply
         self.error = error
+        self.calls: list[list[dict]] = []
+
+    async def chat(self, messages, tools=None):
+        self.calls.append([dict(message) for message in messages])
+        if self.error is not None:
+            raise self.error
+        return {"role": "assistant", "content": self.reply}
 
 
-class FakeOrchestrator:
-    def __init__(self, event) -> None:
-        self.event = event
-        self.calls: list[dict] = []
-
-    def start_background_reply(self, **kwargs):
-        self.calls.append(kwargs)
-        return self.event
-
-
-def make_runtime(config: dict, *, orchestrator=None):
+def make_runtime(config: dict, *, provider=None):
     module = load_plugin()
-    services = {"reply_orchestrator": orchestrator} if orchestrator is not None else {}
+    services = {"provider": provider} if provider is not None else {}
     ctx = Context(config, services=services)
     cfg = module.Config.model_validate(config)
     runtime = module.TelegramRuntime(ctx, cfg)
@@ -165,7 +160,7 @@ def tg_event(**overrides):
     return event
 
 
-# ── 命令：只保留状态查询 ────────────────────────────────────────────
+# ── 命令：只有状态查询 ──────────────────────────────────────────────
 
 
 def test_only_status_commands_are_registered(scratch):
@@ -179,109 +174,123 @@ def test_only_status_commands_are_registered(scratch):
     assert ctx.app_commands.by_alias("telegram").name == "tg"
     assert ctx.app_commands.by_alias("电报").name == "tg"
     assert ctx.app_commands.by_alias("tgdiag").name == "tg诊断"
-    # 桥接类命令必须不存在
     for gone in ("tg绑定", "tg解绑", "tg列表", "tg推送", "tg会话", "tg重连"):
         assert gone not in commands
 
 
-def test_status_text_reports_ai_endpoint(scratch):
+def test_status_text_reports_model_service(scratch):
+    provider = FakeProvider()
     module, ctx, runtime = make_runtime(
-        {"_data_dir": str(scratch), "token": "123456:abc", "ai_endpoint_id": "10001"}
+        {"_data_dir": str(scratch), "token": "123456:abc", "history_limit": 8}, provider=provider
     )
     text = runtime.status_text()
-    assert "Telegram 直连 AI" in text
-    assert "AI 工作区：私聊 10001" in text
-    assert "计数器" in text
+    assert "Telegram 独立 Bot" in text
+    assert "模型服务：宿主 provider（可用）" in text
+    assert "上下文 8 条/会话" in text
 
 
-def test_diag_reports_orchestrator_and_probe(scratch):
-    orchestrator = FakeOrchestrator(FakeEvent("ok"))
-    module, ctx, runtime = make_runtime(
-        {"_data_dir": str(scratch), "token": "123456:abc", "ai_endpoint_id": "10001"},
-        orchestrator=orchestrator,
-    )
+def test_diag_reports_provider_and_probe(scratch):
+    provider = FakeProvider()
+    module, ctx, runtime = make_runtime({"_data_dir": str(scratch), "token": "123456:abc"}, provider=provider)
     text = asyncio.run(runtime.diag_report())
-    assert "宿主编排器：可用" in text
+    assert "模型服务：宿主 provider（可用）" in text
     assert "连通性探测：通" in text
     assert "123456:***" in text
 
 
-def test_diag_without_orchestrator_warns(scratch):
+def test_diag_without_provider_warns(scratch):
     module, ctx, runtime = make_runtime({"_data_dir": str(scratch), "token": "1:a"})
     text = asyncio.run(runtime.diag_report())
-    assert "宿主编排器：不可用" in text
+    assert "宿主 provider（不可用）" in text
 
 
-# ── AI 直答 ─────────────────────────────────────────────────────────
+# ── 独立 TG 对话 ────────────────────────────────────────────────────
 
 
-def test_reply_with_ai_sends_generated_text(scratch):
-    orchestrator = FakeOrchestrator(FakeEvent("你好呀，我是 NeoBot"))
-    module, ctx, runtime = make_runtime(
-        {"_data_dir": str(scratch), "ai_endpoint_id": "10001", "ai_prefix": "[TG {name}] "},
-        orchestrator=orchestrator,
-    )
+def test_reply_calls_provider_and_sends_text(scratch):
+    provider = FakeProvider("你好呀，我是 NeoBot")
+    module, ctx, runtime = make_runtime({"_data_dir": str(scratch)}, provider=provider)
     asyncio.run(runtime.reply_with_ai(tg_event(text="在吗")))
-    call = orchestrator.calls[0]
-    assert call["kind"] == "private"
-    assert call["conversation_id"] == "10001"
-    assert call["content"].startswith("[TG 小明] ")
-    assert "在吗" in call["content"]
-    assert call["proactive"] is True
-    assert "manager_name" in call
-
-    assert runtime.api.calls[-1][0] == "sendMessage"
-    assert "你好呀，我是 NeoBot" in runtime.api.calls[-1][1]["text"]
+    assert len(provider.calls) == 1
+    messages = provider.calls[0]
+    assert messages[0]["role"] == "system"
+    assert messages[-1] == {"role": "user", "content": "在吗"}
+    assert runtime.api.last_text() == "你好呀，我是 NeoBot"
     assert runtime.counters["ai_replies"] == 1
 
 
-def test_reply_without_endpoint_hints_user(scratch):
+def test_history_is_kept_and_trimmed(scratch):
+    provider = FakeProvider("好的")
+    module, ctx, runtime = make_runtime({"_data_dir": str(scratch), "history_limit": 2}, provider=provider)
+    for text in ("一", "二", "三", "四"):
+        asyncio.run(runtime.reply_with_ai(tg_event(text=text)))
+    last = provider.calls[-1]
+    # system + 最多 2*2 条历史 + 当前 user
+    assert last[0]["role"] == "system"
+    assert last[-1] == {"role": "user", "content": "四"}
+    assert len(last) <= 1 + 4 + 1
+    # 最早那轮已被裁掉，最近的还在
+    assert all(message["content"] != "一" for message in last)
+    assert any(message["content"] == "三" for message in last)
+
+
+def test_history_disabled(scratch):
+    provider = FakeProvider("好")
+    module, ctx, runtime = make_runtime({"_data_dir": str(scratch), "history_limit": 0}, provider=provider)
+    asyncio.run(runtime.reply_with_ai(tg_event(text="一")))
+    asyncio.run(runtime.reply_with_ai(tg_event(text="二")))
+    assert len(provider.calls[-1]) == 2  # system + 当前 user，无历史
+
+
+def test_missing_provider_hints_user(scratch):
     module, ctx, runtime = make_runtime({"_data_dir": str(scratch)})
     asyncio.run(runtime.reply_with_ai(tg_event()))
-    assert runtime.api.calls, "应当给用户发提示"
-    assert "AI 工作区" in runtime.api.calls[-1][1]["text"]
-    assert runtime.counters["ai_replies"] == 0
-
-
-def test_ask_ai_busy_returns_empty(scratch):
-    orchestrator = FakeOrchestrator(None)  # 宿主返回 None：已有回复在进行
-    module, ctx, runtime = make_runtime(
-        {"_data_dir": str(scratch), "ai_endpoint_id": "10001"}, orchestrator=orchestrator
-    )
-    text = asyncio.run(runtime._ask_ai("[TG 小明] 在吗"))
-    assert text == ""
-    assert runtime.counters["ai_busy"] == 1
-
-
-def test_ask_ai_empty_generation_returns_empty(scratch):
-    orchestrator = FakeOrchestrator(FakeEvent("", state="FAILED", error="model down"))
-    module, ctx, runtime = make_runtime(
-        {"_data_dir": str(scratch), "ai_endpoint_id": "10001"}, orchestrator=orchestrator
-    )
-    text = asyncio.run(runtime._ask_ai("[TG 小明] 在吗"))
-    assert text == ""
-    assert "AI 未产出回复" in ctx.logger.text()
-
-
-def test_reply_sends_error_message_when_ai_fails(scratch):
-    orchestrator = FakeOrchestrator(FakeEvent("", state="FAILED"))
-    module, ctx, runtime = make_runtime(
-        {"_data_dir": str(scratch), "ai_endpoint_id": "10001", "ai_error_reply": "（忙，稍后再试）"},
-        orchestrator=orchestrator,
-    )
-    asyncio.run(runtime.reply_with_ai(tg_event()))
-    assert runtime.api.calls[-1][1]["text"] == "（忙，稍后再试）"
+    assert "provider" in runtime.api.last_text()
     assert runtime.counters["ai_failures"] == 1
 
 
-def test_compose_includes_prefix_and_media_placeholder(scratch):
-    module, ctx, runtime = make_runtime({"_data_dir": str(scratch), "ai_prefix": "[TG {name}] "})
-    event = tg_event(text="看图")
-    event.media = [SimpleNamespace(kind="photo")]
-    composed = runtime.compose(event)
-    assert composed.startswith("[TG 小明] ")
-    assert "看图" in composed
+def test_provider_error_sends_error_reply(scratch):
+    provider = FakeProvider(error=RuntimeError("boom"))
+    module, ctx, runtime = make_runtime(
+        {"_data_dir": str(scratch), "ai_error_reply": "（忙，稍后再试）"}, provider=provider
+    )
+    asyncio.run(runtime.reply_with_ai(tg_event()))
+    assert runtime.api.last_text() == "（忙，稍后再试）"
+    assert runtime.counters["ai_failures"] == 1
+    assert "模型调用失败" in ctx.logger.text()
 
+
+def test_provider_timeout_sends_error_reply(scratch):
+    provider = FakeProvider("不该出现")
+    module, ctx, runtime = make_runtime(
+        {"_data_dir": str(scratch), "ai_error_reply": "（超时）"}, provider=provider
+    )
+
+    async def fake_wait_for(coro, timeout):  # 关掉未 await 的协程，避免告警
+        if hasattr(coro, "close"):
+            coro.close()
+        raise asyncio.TimeoutError
+
+    with patch("asyncio.wait_for", side_effect=fake_wait_for):
+        asyncio.run(runtime.reply_with_ai(tg_event()))
+    assert runtime.api.last_text() == "（超时）"
+    assert "模型调用超时" in ctx.logger.text()
+
+
+def test_empty_model_content_counts_as_failure(scratch):
+    provider = FakeProvider("")
+    module, ctx, runtime = make_runtime(
+        {"_data_dir": str(scratch), "ai_error_reply": "（空）"}, provider=provider
+    )
+    asyncio.run(runtime.reply_with_ai(tg_event()))
+    assert runtime.api.last_text() == "（空）"
+    assert runtime.counters["ai_failures"] == 1
+    assert "空内容" in ctx.logger.text()
+
+
+def test_compose_uses_text_or_media_placeholder(scratch):
+    module, ctx, runtime = make_runtime({"_data_dir": str(scratch)})
+    assert runtime.compose(tg_event(text="看图")) == "看图"
     empty = tg_event(text="")
     empty.media = [SimpleNamespace(kind="photo")]
     assert "photo" in runtime.compose(empty)
@@ -289,18 +298,16 @@ def test_compose_includes_prefix_and_media_placeholder(scratch):
 
 # ── 入站分发 ───────────────────────────────────────────────────────
 
+
 def test_dispatch_ignores_other_bots(scratch):
-    orchestrator = FakeOrchestrator(FakeEvent("x"))
-    module, ctx, runtime = make_runtime(
-        {"_data_dir": str(scratch), "ai_endpoint_id": "10001"}, orchestrator=orchestrator
-    )
-    event = tg_event(user_is_bot=True)
-    asyncio.run(runtime.dispatch(event))
-    assert orchestrator.calls == []
+    provider = FakeProvider()
+    module, ctx, runtime = make_runtime({"_data_dir": str(scratch)}, provider=provider)
+    asyncio.run(runtime.dispatch(tg_event(user_is_bot=True)))
+    assert provider.calls == []
     assert runtime.counters["dropped_bot"] == 1
 
 
-def test_dispatch_skips_callback_and_answers_it(scratch):
+def test_dispatch_answers_callback(scratch):
     module, ctx, runtime = make_runtime({"_data_dir": str(scratch)})
     event = tg_event()
     event.kind = "callback_query"
@@ -338,11 +345,11 @@ def test_resolve_endpoint_priority_and_normalization(scratch):
 def test_config_strips_quotes(scratch):
     module = load_plugin()
     config = module.Config.model_validate(
-        {"token": '"123456:abc"', "proxy": '"http://127.0.0.1:7890/"', "ai_endpoint_id": '"10001"'}
+        {"token": '"123456:abc"', "proxy": '"http://127.0.0.1:7890/"', "system_prompt": '"你是猫娘"'}
     )
     assert config.token == "123456:abc"
     assert config.proxy == "http://127.0.0.1:7890/"
-    assert config.ai_endpoint_id == "10001"
+    assert config.system_prompt == "你是猫娘"
 
 
 def test_diag_masks_reverse_proxy_secret(scratch):
@@ -394,8 +401,8 @@ def test_on_load_and_shutdown(scratch):
 
 
 def test_service_facade_exposed(scratch):
-    module, ctx, runtime = make_runtime({"_data_dir": str(scratch), "ai_endpoint_id": "10001"})
+    module, ctx, runtime = make_runtime({"_data_dir": str(scratch)}, provider=FakeProvider())
     module._provide_service(ctx, runtime)
     facade = ctx.services.provided.get("telegram")
     assert facade is not None
-    assert "Telegram 直连 AI" in facade.status()
+    assert "Telegram 独立 Bot" in facade.status()

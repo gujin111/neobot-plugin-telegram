@@ -1,5 +1,37 @@
 # Changelog
 
+## 2.1.0
+
+**彻底去掉 QQ 依赖**：不再借用宿主的 QQ 回复管线，改为直接调用宿主的**主模型服务**
+（`provider`），上下文由插件按 TG 会话自己维护。这样 Telegram 侧完全不产生任何 QQ 消息、
+也不需要填 QQ 群号/QQ 号。
+
+### 破坏性变更
+
+- 删除配置 `ai_endpoint_kind`、`ai_endpoint_id`、`ai_channel`、`ai_prefix`；
+- 新增配置 `system_prompt`、`history_limit`、`ai_timeout`、`ai_error_reply`；
+- AI 调用从「`reply_orchestrator.start_background_reply` + 读事件」改为
+  「`provider.chat(messages)` 直接拿结果」。
+
+### 新增
+
+- **每个 TG 会话独立上下文**（内存，默认 12 条，`history_limit=0` 可关）；
+- 超时（`asyncio.wait_for`）、模型异常、空回复三种情况都有明确降级与计数；
+- `/tg状态`、`/tg诊断` 显示模型服务可用性、上下文条数与 `system_prompt` 长度。
+
+### 说明
+
+- 模型用的是 NeoBot 面板里配置的那个，**不需要另填 API Key**；
+- 不经过宿主的工具/技能/人格/记忆，`system_prompt` 自己写；
+- 上下文在内存里，重启清空；群聊所有成员共用一个上下文。
+
+### 验证
+
+- 单元测试 **59/59**（provider 调用、上下文累积与裁剪、超时/异常/空回复降级、
+  命令集只有两条、配置清理、地址解析、诊断）；
+- `devtools/simulate.py` 通过（假 provider 驱动两轮对话并验证上下文）；
+- 契约导出为 2.1.0。
+
 ## 2.0.0
 
 **破坏性变更**：移除 QQ 桥接，改为「Telegram 直连 AI」。
