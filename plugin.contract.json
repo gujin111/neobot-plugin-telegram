@@ -4,29 +4,49 @@
     "additionalProperties": true,
     "description": "插件配置；运行值在 data/plugins_data/telegram/config.toml。",
     "properties": {
-      "admins": {
-        "description": "额外管理员 QQ 号 / 官方 openid：可执行绑定与推送",
-        "items": {
-          "anyOf": [
-            {
-              "type": "integer"
-            },
-            {
-              "type": "string"
-            }
-          ]
-        },
-        "title": "Admins",
-        "type": "array"
+      "ai_channel": {
+        "default": "",
+        "description": "AI 工作区所在通道：onebot / official；留空让宿主自动判断",
+        "title": "Ai Channel",
+        "type": "string"
       },
-      "allow_sub_admin": {
-        "default": true,
-        "description": "允许次级管理员执行绑定 / 推送类命令",
-        "title": "Allow Sub Admin",
-        "type": "boolean"
+      "ai_endpoint_id": {
+        "default": "",
+        "description": "AI 工作区 ID：填一个 QQ 号（私聊）或群号（群聊）。AI 在这里生成回复，宿主也会把回复发到这里",
+        "title": "Ai Endpoint Id",
+        "type": "string"
+      },
+      "ai_endpoint_kind": {
+        "default": "private",
+        "description": "AI 工作区类型：私聊或群聊（对应宿主的 kind）",
+        "enum": [
+          "private",
+          "group"
+        ],
+        "title": "Ai Endpoint Kind",
+        "type": "string"
+      },
+      "ai_error_reply": {
+        "default": "（AI 暂时没有响应，请稍后再试）",
+        "description": "AI 没产出时回给 TG 用户的文案，留空则不回复",
+        "title": "Ai Error Reply",
+        "type": "string"
+      },
+      "ai_prefix": {
+        "default": "[TG {name}] ",
+        "description": "交给 AI 时给消息加的前缀，支持 {name} {chat} {id}",
+        "title": "Ai Prefix",
+        "type": "string"
+      },
+      "ai_timeout": {
+        "default": 90.0,
+        "description": "等待 AI 生成回复的超时（秒）",
+        "minimum": 5.0,
+        "title": "Ai Timeout",
+        "type": "number"
       },
       "allowed_updates": {
-        "description": "只接收这些类型的更新；留空 = 全部（含 chat_member，修正 Koishi 侧的默认遗漏）",
+        "description": "只接收这些类型的更新；留空 = 全部（含 chat_member）",
         "items": {
           "type": "string"
         },
@@ -49,31 +69,13 @@
       },
       "endpoint": {
         "default": "https://api.telegram.org",
-        "description": "Bot API 终结点；国内直连不通时改为反代地址",
+        "description": "Bot API 终结点；直连不通时改为反代地址",
         "title": "Endpoint",
         "type": "string"
       },
-      "forward_bot_messages": {
-        "default": true,
-        "description": "把 QQ 侧机器人自己的消息（含 AI 回复）转发到 Telegram",
-        "title": "Forward Bot Messages",
-        "type": "boolean"
-      },
-      "forward_commands": {
-        "default": false,
-        "description": "把 / 开头的命令也转发到 Telegram",
-        "title": "Forward Commands",
-        "type": "boolean"
-      },
-      "forward_user_messages": {
-        "default": true,
-        "description": "把 QQ 侧其他成员的消息转发到 Telegram",
-        "title": "Forward User Messages",
-        "type": "boolean"
-      },
       "ignore_telegram_bots": {
         "default": true,
-        "description": "忽略 Telegram 侧其他机器人发的消息（防互刷）",
+        "description": "忽略其它机器人发的消息",
         "title": "Ignore Telegram Bots",
         "type": "boolean"
       },
@@ -101,21 +103,9 @@
         "title": "Polling Timeout",
         "type": "integer"
       },
-      "prefix_from_qq": {
-        "default": "[QQ {name}] ",
-        "description": "QQ → Telegram 的前缀；支持 {name} {group} {id}",
-        "title": "Prefix From Qq",
-        "type": "string"
-      },
-      "prefix_from_tg": {
-        "default": "[TG {name}] ",
-        "description": "Telegram → QQ 的前缀；支持 {name} {chat} {id}",
-        "title": "Prefix From Tg",
-        "type": "string"
-      },
       "protocol": {
         "default": "polling",
-        "description": "通信方式；当前只实现 polling（webhook 需要宿主提供入站 HTTP 端点）",
+        "description": "通信方式；当前只实现 polling",
         "enum": [
           "polling",
           "webhook"
@@ -125,7 +115,7 @@
       },
       "proxy": {
         "default": "",
-        "description": "网络代理：http://127.0.0.1:7890、socks5://127.0.0.1:1080（内置实现，不需要 socksio），或 auto 自动探测宿主上的 Clash / v2ray 端口",
+        "description": "网络代理：http://…、socks5://…（内置实现，不需要 socksio），或 auto 自动探测",
         "title": "Proxy",
         "type": "string"
       },
@@ -144,14 +134,14 @@
         "type": "integer"
       },
       "reverse_proxy_secret": {
-        "description": "反代路径密钥，与 Worker 的 PATH_SECRET 一致；Worker 没设密钥时留空",
+        "description": "反代路径密钥，与 Worker 的 PATH_SECRET 一致",
         "title": "Reverse Proxy Secret",
         "type": "string",
         "writeOnly": true
       },
       "reverse_proxy_url": {
         "default": "",
-        "description": "反代基址（如 https://tg.example.workers.dev）；填了它优先于 endpoint，配合 extras/cloudflare-worker.js",
+        "description": "反代基址（如 https://tg.example.com）；填了优先于 endpoint",
         "title": "Reverse Proxy Url",
         "type": "string"
       },
@@ -167,9 +157,9 @@
   },
   "guides": [],
   "plugin": {
-    "description": "Telegram 桥接：移植 Koishi Telegram 适配器（长轮询 + QQ 双向互通）",
+    "description": "Telegram 直连 AI：TG 用户直接和 NeoBot 对话（只保留状态查询命令）",
     "name": "telegram",
-    "version": "1.1.2"
+    "version": "2.0.0"
   },
   "resources": [],
   "schema_version": 1

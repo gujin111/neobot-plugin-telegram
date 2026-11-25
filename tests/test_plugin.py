@@ -1,6 +1,6 @@
-"""插件级用例：命令注册（/help 展示）、管理准入、桥接路由、状态文本。
+"""插件级用例：状态查询命令、AI 直答（用假编排器）、配置清理、链路诊断。
 
-这些用例需要 ``neobot_modloader``（用 PYTHONPATH 指向 NeoBot 的 packages/*/src）；
+需要 ``neobot_modloader``（PYTHONPATH 指向 NeoBot 的 packages/*/src），
 缺失时 ``_loader.load_plugin`` 会 skip。
 """
 
@@ -12,10 +12,8 @@ from types import SimpleNamespace
 
 from _loader import load_plugin
 
-GROUP = 123456789
-ADMIN = 10001
-MEMBER = 20001
-TG_GROUP = "-1001234567890"
+CHAT = "123456789"
+NAME = "小明"
 
 
 class Logger:
@@ -63,28 +61,16 @@ class AppCommands:
 
         return decorate
 
-    def by_alias(self, alias: str) -> SimpleNamespace | None:
+    def by_alias(self, alias: str):
         for command in self.commands.values():
             if alias == command.name or alias in command.aliases:
                 return command
         return None
 
 
-class Permissions:
-    def __init__(self, admins: set[str]) -> None:
-        self.admins = admins
-
-    def can(self, user_id, level):
-        return str(user_id) in self.admins and level >= 1
-
-
-class Adapter:
-    self_id = 99999
-
-
 class Services:
-    def __init__(self) -> None:
-        self.provided: dict[str, object] = {}
+    def __init__(self, provided: dict | None = None) -> None:
+        self.provided: dict[str, object] = dict(provided or {})
 
     def provide(self, name, service, **kwargs):
         self.provided[name] = service
@@ -94,45 +80,17 @@ class Services:
 
 
 class Context:
-    def __init__(self, config: dict, *, host_admins: set[str] | None = None) -> None:
+    def __init__(self, config: dict, *, services: dict | None = None) -> None:
         self.config = config
         self.data_dir = pathlib.Path(config.get("_data_dir", "."))
         self.logger = Logger()
         self.app_commands = AppCommands()
-        self.adapter = Adapter()
-        self.services = Services()
-        self.sent: list[tuple[str, str, str, str]] = []
-        self._host_admins = host_admins or set()
-
-    async def send_group(self, group_id, message, *, proactive=False):
-        self.sent.append(("group", str(group_id), _text_of(message), str(proactive)))
-        return {"status": "ok"}
-
-    async def send_private(self, user_id, message, *, proactive=False):
-        self.sent.append(("private", str(user_id), _text_of(message), str(proactive)))
-        return {"status": "ok"}
-
-
-def _text_of(payload) -> str:
-    """从 MessageChain 里取纯文本；2.0.1 没有 plain_text，所以要逐级回退。"""
-    for attr in ("plain_text", "text", "content"):
-        value = getattr(payload, attr, None)
-        if isinstance(value, str) and value:
-            return value
-    segments = getattr(payload, "message", None) or getattr(payload, "segments", None) or ()
-    parts: list[str] = []
-    for segment in segments:
-        data = getattr(segment, "data", None)
-        if data is None and isinstance(segment, dict):
-            data = segment.get("data")
-        if isinstance(data, dict):
-            parts.append(str(data.get("text") or ""))
-    joined = "".join(parts)
-    return joined or str(payload)
+        self.adapter = SimpleNamespace(self_id=99999)
+        self.services = Services(services)
 
 
 class FakeAPI:
-    """替代 TelegramAPI：记录 sendMessage 等调用。"""
+    """替代 TelegramAPI：记录调用，可选返回固定结果。"""
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict]] = []
@@ -146,271 +104,270 @@ class FakeAPI:
         self.answers.append(callback_id)
         return True
 
+    async def probe(self, *, timeout=6.0):
+        return True, "@bot（12 ms）"
+
     async def close(self):
         return None
 
+    @property
+    def gateway_url(self) -> str:
+        return ""
 
-def make_runtime(config: dict, *, host_admins: set[str] | None = None):
+    def sent_texts(self) -> list[str]:
+        return [params.get("text", "") for method, params in self.calls if method == "sendMessage"]
+
+
+class FakeEvent:
+    """冒充 ReplyEvent：只需要 generated_text / state / error。"""
+
+    def __init__(self, text: str = "", state: str = "COMPLETED", error=None) -> None:
+        self.generated_text = text
+        self.state = SimpleNamespace(name=state)
+        self.error = error
+
+
+class FakeOrchestrator:
+    def __init__(self, event) -> None:
+        self.event = event
+        self.calls: list[dict] = []
+
+    def start_background_reply(self, **kwargs):
+        self.calls.append(kwargs)
+        return self.event
+
+
+def make_runtime(config: dict, *, orchestrator=None):
     module = load_plugin()
-    ctx = Context(config, host_admins=host_admins)
+    services = {"reply_orchestrator": orchestrator} if orchestrator is not None else {}
+    ctx = Context(config, services=services)
     cfg = module.Config.model_validate(config)
     runtime = module.TelegramRuntime(ctx, cfg)
     runtime.api = FakeAPI()
     return module, ctx, runtime
 
 
-def command_context(
-    *, raw_args: str = "", user_id: int = MEMBER, kind: str = "group", host_admins: set[str] | None = None
-):
-    service = SimpleNamespace(permissions=Permissions(host_admins or set()))
-    return SimpleNamespace(
-        kind=kind,
-        conv_id=str(GROUP),
-        user_id=user_id,
-        raw_args=raw_args,
-        args=raw_args.split(),
-        command=SimpleNamespace(name="tg"),
-        service=service,
-        replies=[],
+def tg_event(**overrides):
+    from tg_model import IncomingEvent, parse_text
+
+    text = overrides.pop("text", "你好")
+    event = IncomingEvent(
+        kind="message",
+        chat_id=str(overrides.pop("chat_id", CHAT)),
+        chat_type="private",
+        message_id=int(overrides.pop("message_id", 11)),
+        user_id=str(overrides.pop("user_id", "7")),
+        user_name=str(overrides.pop("user_name", NAME)),
+        spans=parse_text(text, []),
     )
+    for key, value in overrides.items():
+        setattr(event, key, value)
+    return event
 
 
-# ── 命令展示页（/help） ──────────────────────────────────────────────
+# ── 命令：只保留状态查询 ────────────────────────────────────────────
 
 
-def test_all_shortcut_commands_registered_with_help_metadata(scratch):
+def test_only_status_commands_are_registered(scratch):
     module, ctx, _ = make_runtime({"_data_dir": str(scratch), "token": "1:abc"})
     module.register_commands(ctx, module.Config.model_validate({"token": "1:abc"}))
     commands = ctx.app_commands.commands
-    # 8 条快捷命令全部进宿主命令表
-    assert set(commands) == {"tg", "tg绑定", "tg解绑", "tg列表", "tg推送", "tg会话", "tg诊断", "tg重连"}
+    assert set(commands) == {"tg", "tg诊断"}
     for name, command in commands.items():
-        assert command.description, f"{name} 缺少 description"
-    # 带参数的命令要有 usage 或 params，/help 详情页才不是空的
-    for name in ("tg", "tg绑定", "tg解绑", "tg推送"):
-        command = commands[name]
-        assert command.usage or command.params, f"{name} 既没有 usage 也没有 params"
-    # 别名都解析到真实命令（/help 里同一条，可直接当快捷命令用）
-    assert ctx.app_commands.by_alias("tgbind").name == "tg绑定"
+        assert command.description, f"{name} 缺 description"
+        assert command.permission == 0
     assert ctx.app_commands.by_alias("telegram").name == "tg"
     assert ctx.app_commands.by_alias("电报").name == "tg"
-    assert ctx.app_commands.by_alias("tgsend").name == "tg推送"
     assert ctx.app_commands.by_alias("tgdiag").name == "tg诊断"
-    assert ctx.app_commands.by_alias("tgreload").name == "tg重连"
-    # 绑定类命令自己把关权限，所以注册等级是 0（描述里写明需管理员）
-    assert ctx.app_commands.by_alias("tgbind").permission == 0
-    assert "需管理员" in ctx.app_commands.by_alias("tgbind").description
+    # 桥接类命令必须不存在
+    for gone in ("tg绑定", "tg解绑", "tg列表", "tg推送", "tg会话", "tg重连"):
+        assert gone not in commands
 
 
-def test_register_commands_degrades_without_registrar(scratch):
-    module, ctx, _ = make_runtime({"_data_dir": str(scratch)})
-    ctx.app_commands = None
-    module.register_commands(ctx, module.Config.model_validate({}))
-    assert "命令未注册" in ctx.logger.text()
+def test_status_text_reports_ai_endpoint(scratch):
+    module, ctx, runtime = make_runtime(
+        {"_data_dir": str(scratch), "token": "123456:abc", "ai_endpoint_id": "10001"}
+    )
+    text = runtime.status_text()
+    assert "Telegram 直连 AI" in text
+    assert "AI 工作区：私聊 10001" in text
+    assert "计数器" in text
 
 
-# ── 管理准入 ─────────────────────────────────────────────────────────
+def test_diag_reports_orchestrator_and_probe(scratch):
+    orchestrator = FakeOrchestrator(FakeEvent("ok"))
+    module, ctx, runtime = make_runtime(
+        {"_data_dir": str(scratch), "token": "123456:abc", "ai_endpoint_id": "10001"},
+        orchestrator=orchestrator,
+    )
+    text = asyncio.run(runtime.diag_report())
+    assert "宿主编排器：可用" in text
+    assert "连通性探测：通" in text
+    assert "123456:***" in text
 
 
-def test_may_admin_accepts_plugin_admins_and_host_admins(scratch):
-    module, ctx, runtime = make_runtime({"_data_dir": str(scratch), "admins": [ADMIN]})
-    assert module._may_admin(ctx, runtime.config, command_context(user_id=ADMIN), ADMIN) is True
-    host_ctx = command_context(user_id=MEMBER, host_admins={str(MEMBER)})
-    assert module._may_admin(ctx, runtime.config, host_ctx, MEMBER) is True
-    assert module._may_admin(ctx, runtime.config, command_context(user_id=MEMBER), MEMBER) is False
+def test_diag_without_orchestrator_warns(scratch):
+    module, ctx, runtime = make_runtime({"_data_dir": str(scratch), "token": "1:a"})
+    text = asyncio.run(runtime.diag_report())
+    assert "宿主编排器：不可用" in text
 
 
-def test_admin_commands_reject_member(scratch):
-    module, ctx, runtime = make_runtime({"_data_dir": str(scratch), "admins": [ADMIN]})
-    reply = asyncio.run(module._run_command(ctx, runtime, "bind", command_context(raw_args="-100", user_id=MEMBER)))
-    assert "权限不足" in reply
+# ── AI 直答 ─────────────────────────────────────────────────────────
 
 
-# ── 命令行为 ─────────────────────────────────────────────────────────
+def test_reply_with_ai_sends_generated_text(scratch):
+    orchestrator = FakeOrchestrator(FakeEvent("你好呀，我是 NeoBot"))
+    module, ctx, runtime = make_runtime(
+        {"_data_dir": str(scratch), "ai_endpoint_id": "10001", "ai_prefix": "[TG {name}] "},
+        orchestrator=orchestrator,
+    )
+    asyncio.run(runtime.reply_with_ai(tg_event(text="在吗")))
+    call = orchestrator.calls[0]
+    assert call["kind"] == "private"
+    assert call["conversation_id"] == "10001"
+    assert call["content"].startswith("[TG 小明] ")
+    assert "在吗" in call["content"]
+    assert call["proactive"] is True
+    assert "manager_name" in call
 
-
-def test_bind_list_unbind_and_send_flow(scratch):
-    module, ctx, runtime = make_runtime({"_data_dir": str(scratch), "admins": [ADMIN]})
-    runtime.chats[TG_GROUP] = {"id": TG_GROUP, "type": "supergroup", "title": "TG群", "last_seen": 0}
-
-    bound = asyncio.run(module._run_command(ctx, runtime, "bind", command_context(raw_args=TG_GROUP, user_id=ADMIN)))
-    assert "已绑定" in bound
-    assert runtime.store.bindings[0].qq_kind == "group"
-    assert runtime.store.bindings[0].tg_title == "TG群"
-
-    listed = asyncio.run(module._run_command(ctx, runtime, "list", command_context(user_id=ADMIN)))
-    assert "TG群" in listed
-
-    sent = asyncio.run(module._run_command(ctx, runtime, "send", command_context(raw_args="部署完成", user_id=ADMIN)))
-    assert "已推送到 1 个 Telegram 会话" in sent
     assert runtime.api.calls[-1][0] == "sendMessage"
-    assert runtime.api.calls[-1][1]["chat_id"] == TG_GROUP
-    assert "部署完成" in runtime.api.calls[-1][1]["text"]
-
-    removed = asyncio.run(module._run_command(ctx, runtime, "unbind", command_context(raw_args=TG_GROUP, user_id=ADMIN)))
-    assert "已解除 1 条绑定" in removed
+    assert "你好呀，我是 NeoBot" in runtime.api.calls[-1][1]["text"]
+    assert runtime.counters["ai_replies"] == 1
 
 
-def test_send_without_binding_hints(scratch):
-    module, ctx, runtime = make_runtime({"_data_dir": str(scratch), "admins": [ADMIN]})
-    reply = asyncio.run(module._run_command(ctx, runtime, "send", command_context(raw_args="x", user_id=ADMIN)))
-    assert "还没有绑定" in reply
-
-
-def test_status_subcommand_dispatch_and_chats(scratch):
-    module, ctx, runtime = make_runtime({"_data_dir": str(scratch), "token": "123456:abc"})
-    runtime.chats[TG_GROUP] = {"id": TG_GROUP, "type": "supergroup", "title": "TG群", "last_seen": 0}
-    chats = asyncio.run(module._run_command(ctx, runtime, "status", command_context(raw_args="chats")))
-    assert "TG群" in chats and TG_GROUP in chats
-    status = asyncio.run(module._run_command(ctx, runtime, "status", command_context()))
-    assert "Telegram 桥接状态" in status and "绑定：0 条" in status
-
-
-def test_status_and_diag_mask_token(scratch):
-    module, ctx, runtime = make_runtime(
-        {"_data_dir": str(scratch), "token": "123456:secret", "proxy": "http://127.0.0.1:7890"}
-    )
-    diag = runtime.diag_text()
-    assert "123456:***" in diag
-    assert "secret" not in diag
-    assert "proxy：http://127.0.0.1:7890" in diag
-    assert "计数器" in diag
-
-
-# ── 桥接路由 ─────────────────────────────────────────────────────────
-
-
-def qq_event(*, user_id=MEMBER, text="你好", message_type="group"):
-    return {
-        "post_type": "message",
-        "message_type": message_type,
-        "group_id": GROUP if message_type == "group" else 0,
-        "user_id": user_id,
-        "self_id": Adapter.self_id,
-        "sender": {"card": "小明", "nickname": "小明"},
-        "message": [{"type": "text", "data": {"text": text}}],
-    }
-
-
-def test_forward_from_qq_requires_binding(scratch):
+def test_reply_without_endpoint_hints_user(scratch):
     module, ctx, runtime = make_runtime({"_data_dir": str(scratch)})
-    assert asyncio.run(runtime.forward_from_qq(qq_event())) == 0
-    assert runtime.api.calls == []
+    asyncio.run(runtime.reply_with_ai(tg_event()))
+    assert runtime.api.calls, "应当给用户发提示"
+    assert "AI 工作区" in runtime.api.calls[-1][1]["text"]
+    assert runtime.counters["ai_replies"] == 0
 
 
-def test_forward_from_qq_user_message(scratch):
-    module, ctx, runtime = make_runtime({"_data_dir": str(scratch), "prefix_from_qq": "[QQ {name}] "})
-    runtime.bind_chat(tg_chat_id=TG_GROUP, qq_kind="group", qq_id=str(GROUP))
-    assert asyncio.run(runtime.forward_from_qq(qq_event())) == 1
-    method, params = runtime.api.calls[-1]
-    assert method == "sendMessage" and params["chat_id"] == TG_GROUP
-    assert "[QQ 小明] 小明: 你好" in params["text"]
-
-
-def test_forward_from_qq_filters_bot_commands_and_echo(scratch):
+def test_ask_ai_busy_returns_empty(scratch):
+    orchestrator = FakeOrchestrator(None)  # 宿主返回 None：已有回复在进行
     module, ctx, runtime = make_runtime(
-        {"_data_dir": str(scratch), "forward_bot_messages": False, "forward_commands": False}
+        {"_data_dir": str(scratch), "ai_endpoint_id": "10001"}, orchestrator=orchestrator
     )
-    runtime.bind_chat(tg_chat_id=TG_GROUP, qq_kind="group", qq_id=str(GROUP))
-    # 机器人自己的消息
-    assert asyncio.run(runtime.forward_from_qq(qq_event(user_id=Adapter.self_id))) == 0
-    # 命令
-    assert asyncio.run(runtime.forward_from_qq(qq_event(text="/help"))) == 0
-    # 回环：刚转发过的内容不再回传
-    runtime.guard.mark("[QQ 小明] 小明: 复读")
-    assert asyncio.run(runtime.forward_from_qq(qq_event(text="复读"))) == 0
-    assert runtime.counters["dropped_echo"] == 1
-    assert runtime.api.calls == []
+    text = asyncio.run(runtime._ask_ai("[TG 小明] 在吗"))
+    assert text == ""
+    assert runtime.counters["ai_busy"] == 1
 
 
-def test_forward_from_qq_bot_message_when_enabled(scratch):
-    module, ctx, runtime = make_runtime({"_data_dir": str(scratch), "forward_bot_messages": True})
-    runtime.bind_chat(tg_chat_id=TG_GROUP, qq_kind="group", qq_id=str(GROUP))
-    assert asyncio.run(runtime.forward_from_qq(qq_event(user_id=Adapter.self_id, text="AI 回复"))) == 1
-    assert runtime.counters["qq_bot_messages"] == 1
+def test_ask_ai_empty_generation_returns_empty(scratch):
+    orchestrator = FakeOrchestrator(FakeEvent("", state="FAILED", error="model down"))
+    module, ctx, runtime = make_runtime(
+        {"_data_dir": str(scratch), "ai_endpoint_id": "10001"}, orchestrator=orchestrator
+    )
+    text = asyncio.run(runtime._ask_ai("[TG 小明] 在吗"))
+    assert text == ""
+    assert "AI 未产出回复" in ctx.logger.text()
 
 
-# ── 入站（Telegram → QQ） ────────────────────────────────────────────
+def test_reply_sends_error_message_when_ai_fails(scratch):
+    orchestrator = FakeOrchestrator(FakeEvent("", state="FAILED"))
+    module, ctx, runtime = make_runtime(
+        {"_data_dir": str(scratch), "ai_endpoint_id": "10001", "ai_error_reply": "（忙，稍后再试）"},
+        orchestrator=orchestrator,
+    )
+    asyncio.run(runtime.reply_with_ai(tg_event()))
+    assert runtime.api.calls[-1][1]["text"] == "（忙，稍后再试）"
+    assert runtime.counters["ai_failures"] == 1
 
 
-def test_tg_message_forwarded_to_bound_qq(scratch):
-    module, ctx, runtime = make_runtime({"_data_dir": str(scratch), "prefix_from_tg": "[TG {name}] "})
-    runtime.bind_chat(tg_chat_id=TG_GROUP, qq_kind="group", qq_id=str(GROUP))
-    update = {
-        "update_id": 1,
-        "message": {
-            "message_id": 5,
-            "date": 1700000000,
-            "chat": {"id": int(TG_GROUP), "type": "supergroup", "title": "TG群"},
-            "from": {"id": 7, "first_name": "小明", "username": "ming"},
-            "text": "从 TG 发的",
-        },
-    }
-    asyncio.run(runtime.handle_updates([update]))
-    assert ctx.sent and ctx.sent[-1][0] == "group" and ctx.sent[-1][1] == str(GROUP)
-    assert "从 TG 发的" in ctx.sent[-1][2]
-    assert runtime.counters["tg_to_qq"] == 1
-    assert TG_GROUP in runtime.chats
+def test_compose_includes_prefix_and_media_placeholder(scratch):
+    module, ctx, runtime = make_runtime({"_data_dir": str(scratch), "ai_prefix": "[TG {name}] "})
+    event = tg_event(text="看图")
+    event.media = [SimpleNamespace(kind="photo")]
+    composed = runtime.compose(event)
+    assert composed.startswith("[TG 小明] ")
+    assert "看图" in composed
+
+    empty = tg_event(text="")
+    empty.media = [SimpleNamespace(kind="photo")]
+    assert "photo" in runtime.compose(empty)
 
 
-def test_tg_bot_messages_are_ignored_by_default(scratch):
-    module, ctx, runtime = make_runtime({"_data_dir": str(scratch)})
-    runtime.bind_chat(tg_chat_id=TG_GROUP, qq_kind="group", qq_id=str(GROUP))
-    update = {
-        "update_id": 1,
-        "message": {
-            "message_id": 5,
-            "date": 1700000000,
-            "chat": {"id": int(TG_GROUP), "type": "supergroup"},
-            "from": {"id": 8, "first_name": "别的机器人", "is_bot": True},
-            "text": "bot says",
-        },
-    }
-    asyncio.run(runtime.handle_updates([update]))
-    assert ctx.sent == []
+# ── 入站分发 ───────────────────────────────────────────────────────
+
+def test_dispatch_ignores_other_bots(scratch):
+    orchestrator = FakeOrchestrator(FakeEvent("x"))
+    module, ctx, runtime = make_runtime(
+        {"_data_dir": str(scratch), "ai_endpoint_id": "10001"}, orchestrator=orchestrator
+    )
+    event = tg_event(user_is_bot=True)
+    asyncio.run(runtime.dispatch(event))
+    assert orchestrator.calls == []
     assert runtime.counters["dropped_bot"] == 1
 
 
-def test_callback_query_is_answered(scratch):
+def test_dispatch_skips_callback_and_answers_it(scratch):
     module, ctx, runtime = make_runtime({"_data_dir": str(scratch)})
-    update = {
-        "update_id": 2,
-        "callback_query": {
-            "id": "cb9",
-            "data": "x",
-            "from": {"id": 7, "first_name": "小明"},
-            "message": {"message_id": 1, "chat": {"id": 7, "type": "private"}},
-        },
-    }
-    asyncio.run(runtime.handle_updates([update]))
-    assert runtime.api.answers == ["cb9"]
+    event = tg_event()
+    event.kind = "callback_query"
+    event.callback_id = "cb1"
+    asyncio.run(runtime.dispatch(event))
+    assert runtime.api.answers == ["cb1"]
 
 
-def test_media_group_is_merged(scratch):
-    module, ctx, runtime = make_runtime({"_data_dir": str(scratch)})
-    runtime.bind_chat(tg_chat_id=TG_GROUP, qq_kind="group", qq_id=str(GROUP))
-    updates = []
-    for index, file_id in enumerate(("a", "b"), start=1):
-        updates.append(
-            {
-                "update_id": index,
-                "message": {
-                    "message_id": index,
-                    "date": 1700000000,
-                    "chat": {"id": int(TG_GROUP), "type": "supergroup", "title": "TG群"},
-                    "from": {"id": 7, "first_name": "小明"},
-                    "media_group_id": "album-1",
-                    "photo": [{"file_id": file_id, "file_size": 10}],
-                },
-            }
-        )
-    asyncio.run(runtime.handle_updates(updates))
-    # 入缓冲，还没投递
-    assert ctx.sent == []
-    merged = runtime.buffer.flush_all()
-    assert len(merged) == 1 and len(merged[0].media) == 2
-    asyncio.run(runtime.dispatch(merged[0]))
-    assert "photo" in ctx.sent[-1][2]
+# ── 配置与地址解析 ─────────────────────────────────────────────────
+
+
+def test_resolve_endpoint_priority_and_normalization(scratch):
+    module, _, _ = make_runtime({"_data_dir": str(scratch)})
+    cases = [
+        ({}, ("https://api.telegram.org", "default")),
+        ({"endpoint": "https://tg.example/"}, ("https://tg.example", "config")),
+        (
+            {"reverse_proxy_url": "https://w.example/", "reverse_proxy_secret": "/v1-abc/"},
+            ("https://w.example/v1-abc", "reverse_proxy"),
+        ),
+        ({"reverse_proxy_url": "https://w.example", "reverse_proxy_secret": ""}, ("https://w.example", "reverse_proxy")),
+        (
+            {"reverse_proxy_url": "https://w.example", "endpoint": "https://ignored.example"},
+            ("https://w.example", "reverse_proxy"),
+        ),
+        ({"reverse_proxy_url": '"https://w.example"'}, ("https://w.example", "reverse_proxy")),
+        ({"reverse_proxy_url": '"https://w.example'}, ("https://w.example", "reverse_proxy")),
+        ({"reverse_proxy_url": "w.example"}, ("https://w.example", "reverse_proxy")),
+        ({"endpoint": "tg.example"}, ("https://tg.example", "config")),
+    ]
+    for raw, expected in cases:
+        assert module._resolve_endpoint(module.Config.model_validate(raw)) == expected, raw
+
+
+def test_config_strips_quotes(scratch):
+    module = load_plugin()
+    config = module.Config.model_validate(
+        {"token": '"123456:abc"', "proxy": '"http://127.0.0.1:7890/"', "ai_endpoint_id": '"10001"'}
+    )
+    assert config.token == "123456:abc"
+    assert config.proxy == "http://127.0.0.1:7890/"
+    assert config.ai_endpoint_id == "10001"
+
+
+def test_diag_masks_reverse_proxy_secret(scratch):
+    module, _, runtime = make_runtime(
+        {
+            "_data_dir": str(scratch),
+            "reverse_proxy_url": "https://w.example",
+            "reverse_proxy_secret": "v1-secret",
+        }
+    )
+    text = runtime.diag_text()
+    assert "https://w.example/***" in text
+    assert "v1-secret" not in text
+    hint = module._connection_hint(runtime.config)
+    assert "反代" in hint and "v1-secret" not in hint
+
+
+def test_hint_explains_hostname_resolution_failure(scratch):
+    module, _, runtime = make_runtime(
+        {"_data_dir": str(scratch), "proxy": "http://host.docker.internal:7890/"}
+    )
+    hint = module._connection_hint(runtime.config, "ConnectError: getaddrinfo failed")
+    assert "主机名解析失败" in hint
+    assert "127.0.0.1" in hint
+    assert "http://host.docker.internal:7890" in hint
 
 
 # ── 生命周期 ─────────────────────────────────────────────────────────
@@ -428,166 +385,17 @@ def test_start_disabled(scratch):
     assert runtime.state == "disabled"
 
 
-def test_shutdown_releases_runtime(scratch):
+def test_on_load_and_shutdown(scratch):
     module, ctx, _ = make_runtime({"_data_dir": str(scratch)})
     asyncio.run(module.on_load(ctx))
+    assert "tg" in ctx.app_commands.commands
     asyncio.run(module.on_shutdown(ctx))
     assert module._RUNTIME is None
 
 
 def test_service_facade_exposed(scratch):
-    module, ctx, runtime = make_runtime({"_data_dir": str(scratch)})
+    module, ctx, runtime = make_runtime({"_data_dir": str(scratch), "ai_endpoint_id": "10001"})
     module._provide_service(ctx, runtime)
     facade = ctx.services.provided.get("telegram")
     assert facade is not None
-    assert "Telegram 桥接状态" in facade.status()
-    assert facade.bindings() == []
-
-
-# ── 连接失败的可操作性（1.0.1） ──────────────────────────────────────
-
-
-def test_connection_hint_covers_direct_proxy_socks_and_endpoint(scratch):
-    module, _, runtime = make_runtime({"_data_dir": str(scratch)})
-    direct = module._connection_hint(runtime.config)
-    assert "未配置代理" in direct and "proxy" in direct
-    proxy = module._connection_hint(module.Config.model_validate({"proxy": "http://127.0.0.1:7890"}))
-    assert "127.0.0.1:7890" in proxy
-    socks = module._connection_hint(module.Config.model_validate({"proxy": "socks5://127.0.0.1:1080"}))
-    assert "内置" in socks and "SOCKS5" in socks
-    endpoint = module._connection_hint(module.Config.model_validate({"endpoint": "https://tg.example"}))
-    assert "tg.example" in endpoint and "/bot<token>" in endpoint
-
-
-def test_hint_explains_hostname_resolution_failure(scratch):
-    """容器里没有 host.docker.internal 时，建议要直接给出替代地址。"""
-    module, _, runtime = make_runtime(
-        {"_data_dir": str(scratch), "proxy": "http://host.docker.internal:7890/"}
-    )
-    hint = module._connection_hint(
-        runtime.config, "TelegramTransportError: getaddrinfo failed"
-    )
-    assert "主机名解析失败" in hint
-    assert "172.17.0.1" in hint and "auto" in hint
-    assert "http://host.docker.internal:7890" in hint  # 末尾斜杠已归一化
-
-
-def test_diag_report_probes_connectivity(scratch):
-    module, ctx, runtime = make_runtime({"_data_dir": str(scratch), "token": "123456:abc"})
-
-    class Probe:
-        def __init__(self, ok):
-            self.ok = ok
-
-        async def probe(self, timeout=6.0):
-            return (self.ok, "@bot（42 ms）" if self.ok else "TelegramTransportError: boom")
-
-    runtime.api = Probe(True)
-    text = asyncio.run(runtime.diag_report())
-    assert "连通性探测：通" in text and "@bot" in text
-
-    runtime.api = Probe(False)
-    text = asyncio.run(runtime.diag_report())
-    assert "连通性探测：不通" in text
-    assert "建议" in text and "未配置代理" in text
-
-
-def test_start_failure_logs_hint_and_schedules_watchdog(scratch):
-    import contextlib
-
-    module, ctx, runtime = make_runtime({"_data_dir": str(scratch), "token": "123456:abc"})
-
-    class Boom:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        async def get_me(self):
-            raise RuntimeError("ConnectError: All connection attempts failed")
-
-        async def probe(self, timeout=6.0):
-            return False, "ConnectError: All connection attempts failed"
-
-        async def close(self):
-            return None
-
-    original = module.TelegramAPI
-    module.TelegramAPI = Boom
-    try:
-
-        async def scenario():
-            await runtime.start()
-            assert runtime.state == "error"
-            assert runtime._watchdog is not None
-            runtime._watchdog.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await runtime._watchdog
-            runtime._watchdog = None
-
-        asyncio.run(scenario())
-    finally:
-        module.TelegramAPI = original
-
-    log = ctx.logger.text()
-    assert "Telegram 连接异常" in log
-    assert "排查建议" in log and "未配置代理" in log
-    assert "endpoint" in log  # 启动日志里打印了实际使用的 endpoint
-
-
-# ── 反代一等配置（1.0.2） ────────────────────────────────────────────
-
-
-def test_resolve_endpoint_priority_and_normalization(scratch):
-    module, _, _ = make_runtime({"_data_dir": str(scratch)})
-    cases = [
-        ({}, ("https://api.telegram.org", "default")),
-        ({"endpoint": "https://tg.example/"}, ("https://tg.example", "config")),
-        (
-            {"reverse_proxy_url": "https://w.example/", "reverse_proxy_secret": "/v1-abc/"},
-            ("https://w.example/v1-abc", "reverse_proxy"),
-        ),
-        ({"reverse_proxy_url": "https://w.example", "reverse_proxy_secret": ""}, ("https://w.example", "reverse_proxy")),
-        (
-            {"reverse_proxy_url": "https://w.example", "endpoint": "https://ignored.example"},
-            ("https://w.example", "reverse_proxy"),
-        ),
-        # 粘贴带来的引号（成对 / 只有开头 / 反引号）都要能剥掉
-        ({"reverse_proxy_url": '"https://w.example"'}, ("https://w.example", "reverse_proxy")),
-        ({"reverse_proxy_url": '"https://w.example'}, ("https://w.example", "reverse_proxy")),
-        ({"reverse_proxy_url": "`https://w.example`"}, ("https://w.example", "reverse_proxy")),
-        # 缺协议头时按 https 补全（用户常见手误）
-        ({"reverse_proxy_url": "w.example"}, ("https://w.example", "reverse_proxy")),
-        ({"endpoint": "tg.example"}, ("https://tg.example", "config")),
-    ]
-    for raw, expected in cases:
-        config = module.Config.model_validate(raw)
-        assert module._resolve_endpoint(config) == expected, raw
-
-
-def test_config_strips_quotes_from_token_and_proxy(scratch):
-    module = load_plugin()
-    config = module.Config.model_validate(
-        {"token": '"123456:abc"', "proxy": '"http://127.0.0.1:7890/"'}
-    )
-    assert config.token == "123456:abc"
-    assert config.proxy == "http://127.0.0.1:7890/"
-
-
-def test_diag_and_hint_mask_reverse_proxy_secret(scratch):
-    module, _, runtime = make_runtime(
-        {
-            "_data_dir": str(scratch),
-            "reverse_proxy_url": "https://w.example",
-            "reverse_proxy_secret": "v1-secret",
-        }
-    )
-    text = runtime.diag_text()
-    assert "https://w.example/***" in text
-    assert "v1-secret" not in text
-    assert "来源：反代" in text
-
-    hint = module._connection_hint(runtime.config)
-    assert "反代" in hint
-    assert "v1-secret" not in hint
-    assert "/bot<token>" in hint
-
-
+    assert "Telegram 直连 AI" in facade.status()

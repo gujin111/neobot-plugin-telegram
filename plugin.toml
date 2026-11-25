@@ -1,9 +1,9 @@
 name = "telegram"
-version = "1.1.2"
-description = "Telegram 桥接：移植 Koishi Telegram 适配器（长轮询 / Webhook + QQ 互通）"
+version = "2.0.0"
+description = "Telegram 直连 AI：TG 用户直接和 NeoBot 对话（只保留状态查询命令）"
 author = "NeoBot 第三方插件"
 license = "MIT"
-tags = ["telegram", "adapter", "bridge", "im"]
+tags = ["telegram", "im", "chat", "adapter"]
 repo = "https://github.com/gujin111/neobot-plugin-telegram"
 branch = "main"
 homepage = "https://github.com/gujin111/neobot-plugin-telegram#readme"
@@ -16,62 +16,53 @@ config_hot_reload = false
 min_neobot_version = "2.0.0"
 
 # 下面只是「打包默认值」：安装/更新插件会覆盖这一段。
-# 真正的运行配置在 data/plugins_data/telegram/config.toml（面板「插件 → 配置」可改），
-# 升级插件不会丢。绑定关系在 data/plugins_data/telegram/bindings.json。
+# 真正的运行配置在 data/plugins_data/telegram/config.toml（面板「插件 → 配置」可改）。
 
 [config]
 # 总开关；关闭后不连 Telegram（命令仍可用）
 enabled = true
 # BotFather 发的机器人令牌：123456:ABC-DEF...
 token = ""
-# Telegram Bot API 终结点；国内直连不通时改为反代地址
+# Telegram Bot API 终结点；直连不通时改为反代地址
 endpoint = "https://api.telegram.org"
-# 反代基址（如 https://tg.example.workers.dev）；填了它优先于 endpoint。
-# 配合 extras/cloudflare-worker.js 使用，不需要本地代理。
+# 反代基址（如 https://tg.example.com）；填了它优先于 endpoint
 reverse_proxy_url = ""
-# 反代路径密钥，与 Worker 的 PATH_SECRET 一致；Worker 没设密钥时留空
+# 反代路径密钥，与 Worker 的 PATH_SECRET 一致；没设就留空
 reverse_proxy_secret = ""
-# 网络代理。支持 http://127.0.0.1:7890、socks5://127.0.0.1:1080（内置实现，不需要 socksio），
-# 或写 auto 让插件自动探测宿主上的 Clash / v2ray 端口；留空表示直连。
+# 网络代理。支持 http://…、socks5://…（内置实现，不需要 socksio），或 auto 自动探测；留空直连
 proxy = ""
-# 通信方式：polling（长轮询，免公网）/ webhook（需要公网 HTTPS）
+# 通信方式：polling（长轮询，免公网）
 protocol = "polling"
 # 长轮询单次等待秒数
 polling_timeout = 25
-# 初次连接失败的最大重试次数（超过后进入离线状态，之后按重试间隔继续尝试）
+# 初次连接失败的最大重试次数
 retry_times = 6
 # 断开后的重试间隔（秒）
 retry_interval = 5.0
-# 只接收这些类型的更新；留空 = Telegram 默认（除 chat_member 外全部）
+# 只接收这些类型的更新；留空 = 全部（含 chat_member）
 allowed_updates = []
-# Webhook 配置（protocol = webhook 时生效）
-webhook_path = "/telegram"
-webhook_secret = ""
-webhook_self_url = ""
-# 以 HTML 解析格式发送（Telegram parse_mode=html）
+# 以 HTML 解析格式发送
 parse_mode = "html"
 # 发送链接时展示网页预览
 link_preview = true
 # 长文本自动分段长度上限（Telegram 上限 4096）
 chunk_size = 3500
-# ── 桥接 ──
-# Telegram → QQ 的前缀；支持 {name} {chat} {id}
-prefix_from_tg = "[TG {name}] "
-# QQ → Telegram 的前缀；支持 {name} {group}
-prefix_from_qq = "[QQ {name}] "
-# 把 QQ 侧机器人自己的消息（含 AI 回复）转发到 Telegram
-forward_bot_messages = true
-# 把 QQ 侧其他成员的消息转发到 Telegram
-forward_user_messages = true
-# 把 / 开头的命令也转发到 Telegram
-forward_commands = false
-# 忽略 Telegram 侧其他机器人发的消息（防机器人互刷）
+# 忽略 Telegram 侧其它机器人发的消息
 ignore_telegram_bots = true
-# ── 权限 ──
-# 额外管理员 QQ 号 / 官方 openid：可执行绑定与推送
-admins = []
-# 允许次级管理员（permission=1）执行绑定类命令
-allow_sub_admin = true
+
+# ── AI 接入：TG 消息交给宿主的回复管线生成，再把文本发回 TG ──
+# AI 工作区类型：private（私聊）/ group（群聊）
+ai_endpoint_kind = "private"
+# AI 工作区 ID：一个 QQ 号（私聊）或群号（群聊）。AI 在这里生成回复，宿主也会把回复发到这里
+ai_endpoint_id = ""
+# AI 工作区所在通道：onebot / official；留空让宿主自动判断
+ai_channel = ""
+# 交给 AI 时给消息加的前缀，支持 {name} {chat} {id}
+ai_prefix = "[TG {name}] "
+# 等待 AI 生成回复的超时（秒）
+ai_timeout = 90.0
+# AI 没产出时回给 TG 用户的文案；留空则不回复
+ai_error_reply = "（AI 暂时没有响应，请稍后再试）"
 
 [sdk]
 version = 1

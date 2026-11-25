@@ -1,18 +1,17 @@
-"""宿主模拟器：不连 Telegram、不启动 NeoBot，直接看插件的行为。
+"""宿主模拟器：不连 Telegram、不启动 NeoBot，直接看插件的命令与 AI 直答链路。
 
-跑法（在插件目录内）：
+跑法（在插件目录内，需要 PYTHONPATH 指向 NeoBot 的 packages/*/src）：
 
     python devtools/simulate.py
 
-会依次验证：
+依次验证：
 
-1. `/help` 命令展示页能看到的全部命令、别名、用法与参数；
-2. Telegram → QQ：一条假 Telegram 消息投递到绑定的 QQ 会话；
-3. QQ → Telegram：一条假 QQ 消息转发到绑定的 Telegram 会话（假 API 记录调用）；
-4. 权限：普通成员执行绑定命令被拒；
-5. 诊断文本：token 打码、计数器齐全。
+1. `/help` 命令展示页只剩两条状态命令；
+2. TG 消息 → 宿主回复管线（假编排器）→ AI 文本发回 TG；
+3. 未配置 AI 工作区时给用户的提示；
+4. `/tg诊断` 的连通性探测与编排器可用性。
 
-任一断言失败退出码 1，可直接接进 CI。
+任一断言失败退出码 1。
 """
 
 from __future__ import annotations
@@ -20,7 +19,6 @@ from __future__ import annotations
 import asyncio
 import importlib.machinery
 import pathlib
-import shutil
 import sys
 import types
 from types import SimpleNamespace
@@ -30,21 +28,19 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-# Windows 控制台默认 GBK，打印「⇄」这类字符会 UnicodeEncodeError：统一切到 UTF-8
 for _stream in (sys.stdout, sys.stderr):
     reconfigure = getattr(_stream, "reconfigure", None)
     if callable(reconfigure):
         try:
             reconfigure(encoding="utf-8", errors="replace")
-        except Exception:  # pragma: no cover - 老 Python / 特殊流
+        except Exception:  # pragma: no cover
             pass
 
 FAILURES: list[str] = []
 
 
 def check(label: str, ok: bool, detail: str = "") -> None:
-    mark = "PASS" if ok else "FAIL"
-    print(f"[{mark}] {label}" + (f" —— {detail}" if detail and not ok else ""))
+    print(f"[{'PASS' if ok else 'FAIL'}] {label}" + (f" —— {detail}" if detail and not ok else ""))
     if not ok:
         FAILURES.append(label)
 
@@ -65,20 +61,20 @@ class Logger:
     def __init__(self) -> None:
         self.lines: list[str] = []
 
-    def _push(self, level: str, message) -> None:
-        self.lines.append(f"{level} {message}")
+    def _push(self, level: str, message, **fields) -> None:
+        self.lines.append(f"{level} {message}" + "".join(f" {k}={v}" for k, v in fields.items()))
 
     def info(self, message, **fields):
-        self._push("INFO", message)
+        self._push("INFO", message, **fields)
 
     def warning(self, message, **fields):
-        self._push("WARN", message)
+        self._push("WARN", message, **fields)
 
     def error(self, message, **fields):
-        self._push("ERROR", message)
+        self._push("ERROR", message, **fields)
 
     def debug(self, message, **fields):
-        self._push("DEBUG", message)
+        self._push("DEBUG", message, **fields)
 
 
 class AppCommands:
@@ -90,13 +86,8 @@ class AppCommands:
     def register(self, name, *, description="", usage="", permission=0, aliases=(), params=()):
         def decorate(handler):
             self.commands[name] = SimpleNamespace(
-                name=name,
-                handler=handler,
-                description=description,
-                usage=usage,
-                permission=permission,
-                aliases=tuple(aliases),
-                params=tuple(params),
+                name=name, handler=handler, description=description,
+                usage=usage, permission=permission, aliases=tuple(aliases), params=tuple(params),
             )
             return handler
 
@@ -104,8 +95,8 @@ class AppCommands:
 
 
 class Services:
-    def __init__(self) -> None:
-        self.provided: dict[str, object] = {}
+    def __init__(self, provided: dict) -> None:
+        self.provided = dict(provided)
 
     def provide(self, name, service, **kwargs):
         self.provided[name] = service
@@ -115,22 +106,13 @@ class Services:
 
 
 class Context:
-    def __init__(self, data_dir: pathlib.Path) -> None:
+    def __init__(self, data_dir: pathlib.Path, orchestrator=None) -> None:
         self.data_dir = data_dir
         self.config: dict = {}
         self.logger = Logger()
         self.app_commands = AppCommands()
         self.adapter = SimpleNamespace(self_id=99999)
-        self.services = Services()
-        self.to_qq: list[tuple[str, str, str]] = []
-
-    async def send_group(self, group_id, message, *, proactive=False):
-        self.to_qq.append(("group", str(group_id), getattr(message, "plain_text", str(message))))
-        return {"status": "ok"}
-
-    async def send_private(self, user_id, message, *, proactive=False):
-        self.to_qq.append(("private", str(user_id), getattr(message, "plain_text", str(message))))
-        return {"status": "ok"}
+        self.services = Services({"reply_orchestrator": orchestrator} if orchestrator else {})
 
 
 class FakeAPI:
@@ -139,137 +121,121 @@ class FakeAPI:
 
     async def call(self, method, params=None, *, files=None, retries=None):
         self.calls.append((method, dict(params or {})))
-        print(f"    · Telegram API ← {method} {params}")
         return {"message_id": len(self.calls)}
 
     async def answer_callback_query(self, callback_id, **extra):
         return True
 
+    async def probe(self, *, timeout=6.0):
+        return True, "@sim_bot（8 ms）"
+
     async def close(self):
         return None
+
+    @property
+    def gateway_url(self) -> str:
+        return ""
+
+
+class FakeEvent:
+    def __init__(self, text: str, state: str = "COMPLETED") -> None:
+        self.generated_text = text
+        self.state = SimpleNamespace(name=state)
+        self.error = None
+
+
+class FakeOrchestrator:
+    """模拟宿主 reply_orchestrator：记下调用参数，返回一段假的 AI 文本。"""
+
+    def __init__(self, reply: str) -> None:
+        self.reply = reply
+        self.calls: list[dict] = []
+
+    def start_background_reply(self, **kwargs):
+        self.calls.append(kwargs)
+        return FakeEvent(self.reply)
+
+
+def tg_update() -> dict:
+    return {
+        "update_id": 1,
+        "message": {
+            "message_id": 21,
+            "date": 1700000000,
+            "chat": {"id": 778899, "type": "private", "first_name": "小明"},
+            "from": {"id": 7, "first_name": "小明", "username": "ming"},
+            "text": "你好，介绍一下你自己",
+        },
+    }
 
 
 def main() -> int:
     module = load_plugin()
     scratch = ROOT / ".scratch"
     workdir = scratch / f"sim-{uuid4().hex[:8]}"
-    # 不用 tempfile.mkdtemp：本机沙箱下它创建的目录写文件会 PermissionError
     workdir.mkdir(parents=True, exist_ok=True)
-    print(f"工作目录：{workdir}\n")
 
+    orchestrator = FakeOrchestrator("我是 NeoBot，很高兴在 Telegram 见到你。")
     config = {
         "token": "123456:SIMULATED",
-        "proxy": "http://127.0.0.1:7890",
-        "prefix_from_tg": "[TG {name}] ",
-        "prefix_from_qq": "[QQ {name}] ",
-        "admins": [10001],
+        "reverse_proxy_url": "https://tg.example.com",
+        "reverse_proxy_secret": "v1-demo",
+        "ai_endpoint_kind": "private",
+        "ai_endpoint_id": "10001",
+        "ai_prefix": "[TG {name}] ",
     }
-    ctx = Context(workdir)
+    ctx = Context(workdir, orchestrator=orchestrator)
     ctx.config = config
     cfg = module.Config.model_validate(config)
 
-    # 1) 命令展示页
     print("== /help 命令展示页 ==")
     module.register_commands(ctx, cfg)
-    commands = ctx.app_commands.commands
-    for name, command in commands.items():
-        aliases = f" 别名：{'、'.join(command.aliases)}" if command.aliases else ""
-        usage = f" 用法：/{name} {command.usage}".rstrip()
-        print(f"  /{name}{aliases}")
+    for name, command in ctx.app_commands.commands.items():
+        print(f"  /{name}  别名：{'、'.join(command.aliases) or '无'}")
         print(f"      {command.description}")
-        print(f"     {usage}")
-        for param_name, param_desc in command.params:
-            print(f"      - {param_name}：{param_desc}")
-    check("注册了 8 条快捷命令", len(commands) == 8, str(sorted(commands)))
-    check("别名 tgbind 指向 /tg绑定", ctx.app_commands.commands["tg绑定"].aliases[0] == "tgbind")
-    check("每条命令都有 description", all(item.description for item in commands.values()))
+    check("只注册两条状态命令", set(ctx.app_commands.commands) == {"tg", "tg诊断"})
+    check("桥接命令已移除", "tg绑定" not in ctx.app_commands.commands)
 
     runtime = module.TelegramRuntime(ctx, cfg)
     runtime.api = FakeAPI()
-    runtime.chats["-1001234567890"] = {
-        "id": "-1001234567890",
-        "type": "supergroup",
-        "title": "测试 TG 群",
-        "last_seen": 0,
-    }
+    runtime.state = "online"
+    runtime.bot_username = "sim_bot"
 
-    # 2) Telegram → QQ
-    print("\n== Telegram → QQ ==")
-    binding = runtime.bind_chat(tg_chat_id="-1001234567890", qq_kind="group", qq_id="123456789")
-    print(f"  绑定：{binding.describe()}")
-    update = {
-        "update_id": 1,
-        "message": {
-            "message_id": 7,
-            "date": 1700000000,
-            "chat": {"id": -1001234567890, "type": "supergroup", "title": "测试 TG 群"},
-            "from": {"id": 7, "first_name": "小明", "username": "ming"},
-            "text": "在 Telegram 里说话",
-        },
-    }
-    asyncio.run(runtime.handle_updates([update]))
-    check("投递到绑定的 QQ 群", len(ctx.to_qq) == 1, str(ctx.to_qq))
-    if ctx.to_qq:
-        print(f"  QQ 收到：{ctx.to_qq[-1][2]!r}")
-    check("带上了 TG 前缀与发言人", "TG" in ctx.to_qq[-1][2] and "ming" in ctx.to_qq[-1][2])
+    print("\n== TG 消息 → 宿主 AI → 回 TG ==")
+    asyncio.run(runtime.handle_updates([tg_update()]))
+    check("调用了宿主编排器", len(orchestrator.calls) == 1, str(orchestrator.calls))
+    if orchestrator.calls:
+        call = orchestrator.calls[0]
+        print(f"  交给 AI 的内容：{call['content']!r}")
+        print(f"  工作区：{call['kind']} {call['conversation_id']}，proactive={call['proactive']}")
+        check("内容带 TG 前缀", call["content"].startswith("[TG ") and "ming" in call["content"])
+    sent = [params.get("text", "") for _, params in runtime.api.calls]
+    print(f"  回给 Telegram：{sent[-1]!r}" if sent else "  没有任何发送")
+    check("AI 文本回传到 TG", bool(sent) and "我是 NeoBot" in sent[-1])
+    check("计数器记录了回复", runtime.counters["ai_replies"] == 1)
 
-    # 3) QQ → Telegram
-    print("\n== QQ → Telegram ==")
-    event = {
-        "post_type": "message",
-        "message_type": "group",
-        "group_id": 123456789,
-        "user_id": 20001,
-        "self_id": 99999,
-        "sender": {"card": "群友甲"},
-        "message": [{"type": "text", "data": {"text": "在 QQ 里回复"}}],
-    }
-    sent = asyncio.run(runtime.forward_from_qq(event))
-    check("转发到 Telegram", sent == 1 and runtime.api.calls, str(runtime.api.calls))
-    if runtime.api.calls:
-        print(f"  Telegram 收到：{runtime.api.calls[-1][1].get('text')!r}")
-    check(
-        "转成 HTML 且带 QQ 前缀",
-        "QQ" in runtime.api.calls[-1][1]["text"] and "在 QQ 里回复" in runtime.api.calls[-1][1]["text"],
-    )
+    print("\n== 未配置 AI 工作区 ==")
+    bare = module.TelegramRuntime(ctx, module.Config.model_validate({"token": "1:a"}))
+    bare.api = FakeAPI()
+    asyncio.run(bare.reply_with_ai(module.decode_update(tg_update())))
+    print(f"  回给用户：{bare.api.calls[-1][1]['text']!r}")
+    check("提示去配置 AI 工作区", "AI 工作区" in bare.api.calls[-1][1]["text"])
 
-    # 4) 权限
-    print("\n== 权限 ==")
-    member_ctx = SimpleNamespace(
-        kind="group",
-        conv_id="123456789",
-        user_id=20001,
-        raw_args="-100999",
-        command=SimpleNamespace(name="tg绑定"),
-        service=SimpleNamespace(permissions=SimpleNamespace(can=lambda uid, level: False)),
-    )
-    reply = asyncio.run(module._run_command(ctx, runtime, "bind", member_ctx))
-    check("普通成员被拒", "权限不足" in reply, reply)
-    print(f"  回复：{reply}")
+    print("\n== /tg状态 ==")
+    print("\n".join("  " + line for line in runtime.status_text().splitlines()))
 
-    admin_ctx = SimpleNamespace(
-        kind="group",
-        conv_id="123456789",
-        user_id=10001,
-        raw_args="-100999",
-        command=SimpleNamespace(name="tg绑定"),
-        service=SimpleNamespace(permissions=SimpleNamespace(can=lambda uid, level: False)),
-    )
-    reply = asyncio.run(module._run_command(ctx, runtime, "bind", admin_ctx))
-    check("插件管理员放行", "已绑定" in reply, reply)
-
-    # 5) 诊断
-    print("\n== 诊断 ==")
-    diag = runtime.diag_text()
+    print("\n== /tg诊断 ==")
+    diag = asyncio.run(runtime.diag_report())
     print("\n".join("  " + line for line in diag.splitlines()))
-    check("token 已打码", "123456:***" in diag and "SIMULATED" not in diag)
-    check("计数齐全", "tg_to_qq=1" in diag and "qq_to_tg=1" in diag)
+    check("诊断显示编排器可用", "宿主编排器：可用" in diag)
+    check("诊断做了连通性探测", "连通性探测：通" in diag)
 
     print()
-    # 收尾：别把模拟数据留在插件目录里（SDK check 会遍历目录）
+    import shutil
+
     shutil.rmtree(workdir, ignore_errors=True)
     try:
-        scratch.rmdir()  # 空目录顺手删掉
+        scratch.rmdir()
     except OSError:
         pass
     if FAILURES:

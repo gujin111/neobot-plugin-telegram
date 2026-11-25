@@ -1,24 +1,18 @@
-"""Telegram 桥接 —— NeoBot 插件。
+"""Telegram 直连 AI —— NeoBot 插件（2.0.0）。
 
-把 Koishi 的 ``@koishijs/plugin-adapter-telegram``（``@satorijs/adapter-telegram``）
-以**插件**形态移植到 NeoBot 2.1.x：自包含的 Telegram Bot API 客户端 + QQ ⇄ Telegram
-双向桥接 + 全部快捷命令注册进宿主命令表（``/help`` 命令展示页可见）。
+Telegram 用户直接在 TG 里和 NeoBot 的 AI 对话：插件收 TG 消息 → 交给宿主回复管线生成 →
+把 `ReplyEvent.generated_text` 发回 TG。**不再有任何 QQ 桥接**，只保留状态查询命令。
 
-为什么是「桥接插件」而不是「新增一个协议适配器」：NeoBot 的适配器是宿主核心服务
-（``service_registry`` 里 ``__host__`` 优先级最高，插件覆盖不了 ``adapter``），
-AI 回复的出站固定走宿主 ``adapter.send``，通道只认 ``onebot`` / ``official``。
-所以 Telegram 侧的收与发由本插件自己完成，QQ 侧只借用宿主的
-``ctx.send_group`` / ``ctx.send_private`` 投递。
+为什么需要「AI 端点」：NeoBot 的回复管线以会话为单位（kind + conversation_id），
+`reply_orchestrator.start_background_reply()` 是它对外暴露的程序化入口。所以插件要指定
+一个 QQ 群或私聊当"AI 工作区"——AI 会在这里生成回复（宿主也会把回复发到这里，
+这是宿主行为，插件拦不住）。对单人使用的机器人，填你自己的一个私聊/小群即可。
 
-模块划分（纯逻辑与宿主解耦，便于单测）：
-
-===================  =========================================================
-``tg_api.py``        Bot API 客户端：代理 / 反代、重试退避、长轮询、文件下载
-``tg_model.py``      Update 解码：实体解析、相册聚合、命令与回调
-``tg_send.py``       出站渲染：HTML 转义、标签安全分段、媒体与按钮
-``tg_bridge.py``     绑定存储、路由成型、回环防护
-``__init__.py``      宿主接线：配置、生命周期、命令、消息处理
-===================  =========================================================
+模块：
+    tg_api.py    Bot API 客户端（代理 / 反代 / 重试 / 长轮询 / 文件）
+    tg_model.py  Update 解码（实体、媒体、相册）
+    tg_send.py   出站渲染（HTML、分段、媒体、按钮）
+    tg_proxy.py  内置 SOCKS5 + 本地 CONNECT 网关 + auto 探测
 """
 
 from __future__ import annotations
@@ -26,13 +20,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
-from collections import OrderedDict
-from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from neobot_modloader import MessageChain, Plugin
+from neobot_modloader import Plugin
 
 try:  # 正常路径：NeoBot 以包的形式加载 plugins/telegram/
     from .tg_api import (
@@ -43,16 +35,6 @@ try:  # 正常路径：NeoBot 以包的形式加载 plugins/telegram/
         TelegramPoller,
         TelegramRetryAfter,
         TelegramTransportError,
-    )
-    from .tg_bridge import (
-        Binding,
-        BindingStore,
-        LoopGuard,
-        conversation_of,
-        looks_like_command,
-        qq_body_text,
-        render_qq_to_tg,
-        render_tg_to_qq,
     )
     from .tg_model import IncomingEvent, MediaGroupBuffer, decode_update, update_subtype
     from .tg_proxy import ProxyUnavailable, detect_proxy, parse_proxy
@@ -67,16 +49,6 @@ except ImportError:  # pragma: no cover - 顶层模块加载（pytest 收集 / �
         TelegramRetryAfter,
         TelegramTransportError,
     )
-    from tg_bridge import (
-        Binding,
-        BindingStore,
-        LoopGuard,
-        conversation_of,
-        looks_like_command,
-        qq_body_text,
-        render_qq_to_tg,
-        render_tg_to_qq,
-    )
     from tg_model import IncomingEvent, MediaGroupBuffer, decode_update, update_subtype
     from tg_proxy import ProxyUnavailable, detect_proxy, parse_proxy
     from tg_send import PlanOptions, SendAction, build_actions, render_segments
@@ -85,11 +57,7 @@ except ImportError:  # pragma: no cover - 顶层模块加载（pytest 收集 / �
 
 
 def strip_wrapping_quotes(value: object) -> str:
-    """去掉粘贴时带进来的包裹果引号（``"https://…"`` → ``https://…``）。
-
-    面板/文档里复制配置时很常见：值本身被一对引号包着，或者只有开头那一半。
-    URL / token / 密钥都不会以引号开头或结尾，所以这里可以放心剥。
-    """
+    """去掉粘贴时带进来的包裹果引号（``"https://…"`` → ``https://…``）。"""
     text = str(value or "").strip()
     changed = True
     while changed and text:
@@ -109,110 +77,189 @@ class Config(BaseModel):
 
     model_config = ConfigDict(extra="allow")
 
-    @field_validator("token", "endpoint", "reverse_proxy_url", "reverse_proxy_secret", "proxy", mode="before")
+    @field_validator(
+        "token",
+        "endpoint",
+        "reverse_proxy_url",
+        "reverse_proxy_secret",
+        "proxy",
+        "ai_endpoint_id",
+        "ai_channel",
+        mode="before",
+    )
     @classmethod
     def _clean_strings(cls, value: object) -> str:
         return strip_wrapping_quotes(value)
 
+    # ── 连接 ──
     enabled: bool = Field(default=True, description="总开关；关闭后不连 Telegram（命令仍可用）")
     token: str = Field(default="", description="BotFather 发的机器人令牌：123456:ABC-DEF...")
-    endpoint: str = Field(default=DEFAULT_ENDPOINT, description="Bot API 终结点；国内直连不通时改为反代地址")
+    endpoint: str = Field(default=DEFAULT_ENDPOINT, description="Bot API 终结点；直连不通时改为反代地址")
     reverse_proxy_url: str = Field(
-        default="",
-        description="反代基址（如 https://tg.example.workers.dev）；填了它优先于 endpoint，配合 extras/cloudflare-worker.js",
+        default="", description="反代基址（如 https://tg.example.com）；填了优先于 endpoint"
     )
-    reverse_proxy_secret: str = Field(
-        default="", description="反代路径密钥，与 Worker 的 PATH_SECRET 一致；Worker 没设密钥时留空"
-    )
+    reverse_proxy_secret: str = Field(default="", description="反代路径密钥，与 Worker 的 PATH_SECRET 一致")
     proxy: str = Field(
         default="",
-        description="网络代理：http://127.0.0.1:7890、socks5://127.0.0.1:1080"
-        "（内置实现，不需要 socksio），或 auto 自动探测宿主上的 Clash / v2ray 端口",
+        description="网络代理：http://…、socks5://…（内置实现，不需要 socksio），或 auto 自动探测",
     )
     protocol: Literal["polling", "webhook"] = Field(
-        default="polling", description="通信方式；当前只实现 polling（webhook 需要宿主提供入站 HTTP 端点）"
+        default="polling", description="通信方式；当前只实现 polling"
     )
     polling_timeout: int = Field(default=25, ge=1, le=60, description="长轮询单次等待秒数")
     retry_times: int = Field(default=6, ge=0, description="初次连接失败的最大重试次数")
     retry_interval: float = Field(default=5.0, ge=0.5, description="断开后的重试间隔（秒）")
     allowed_updates: list[str] = Field(
-        default_factory=list,
-        description="只接收这些类型的更新；留空 = 全部（含 chat_member，修正 Koishi 侧的默认遗漏）",
+        default_factory=list, description="只接收这些类型的更新；留空 = 全部（含 chat_member）"
     )
+
+    # ── 消息 ──
     parse_mode: Literal["html", "none"] = Field(default="html", description="发送时使用的解析格式")
     link_preview: bool = Field(default=True, description="发送链接时展示网页预览")
     chunk_size: int = Field(default=3500, ge=200, le=4096, description="长文本自动分段长度上限")
-    prefix_from_tg: str = Field(
-        default="[TG {name}] ", description="Telegram → QQ 的前缀；支持 {name} {chat} {id}"
+    ignore_telegram_bots: bool = Field(default=True, description="忽略其它机器人发的消息")
+
+    # ── AI 接入 ──
+    ai_endpoint_kind: Literal["private", "group"] = Field(
+        default="private", description="AI 工作区类型：私聊或群聊（对应宿主的 kind）"
     )
-    prefix_from_qq: str = Field(
-        default="[QQ {name}] ", description="QQ → Telegram 的前缀；支持 {name} {group} {id}"
+    ai_endpoint_id: str = Field(
+        default="",
+        description="AI 工作区 ID：填一个 QQ 号（私聊）或群号（群聊）。AI 在这里生成回复，"
+        "宿主也会把回复发到这里",
     )
-    forward_bot_messages: bool = Field(default=True, description="把 QQ 侧机器人自己的消息（含 AI 回复）转发到 Telegram")
-    forward_user_messages: bool = Field(default=True, description="把 QQ 侧其他成员的消息转发到 Telegram")
-    forward_commands: bool = Field(default=False, description="把 / 开头的命令也转发到 Telegram")
-    ignore_telegram_bots: bool = Field(default=True, description="忽略 Telegram 侧其他机器人发的消息（防互刷）")
-    admins: list[int | str] = Field(default_factory=list, description="额外管理员 QQ 号 / 官方 openid：可执行绑定与推送")
-    allow_sub_admin: bool = Field(default=True, description="允许次级管理员执行绑定 / 推送类命令")
+    ai_channel: str = Field(
+        default="", description="AI 工作区所在通道：onebot / official；留空让宿主自动判断"
+    )
+    ai_prefix: str = Field(
+        default="[TG {name}] ", description="交给 AI 时给消息加的前缀，支持 {name} {chat} {id}"
+    )
+    ai_timeout: float = Field(default=90.0, ge=5.0, description="等待 AI 生成回复的超时（秒）")
+    ai_error_reply: str = Field(
+        default="（AI 暂时没有响应，请稍后再试）", description="AI 没产出时回给 TG 用户的文案，留空则不回复"
+    )
 
 
 _PLUGIN_KWARGS: dict[str, Any] = dict(
-    version="1.1.2",
-    description="Telegram 桥接：移植 Koishi Telegram 适配器（长轮询 + QQ 双向互通）",
-    usage="发送 @机器人 /tg 查看状态；/tg绑定 建立互通（/help 可查全部命令与别名）",
+    version="2.0.0",
+    description="Telegram 直连 AI：TG 用户直接和 NeoBot 对话（只保留状态查询命令）",
+    usage="发送 /tg 查看状态；/tg诊断 做一次链路探测",
     author="NeoBot 第三方插件",
     config=Config,
 )
 
 try:
-    # provides 是 NeoBot 2.1.0a15 才有的参数（插件服务声明）；老宿主上退化为不声明
+    # provides 是 NeoBot 2.1.0a15 才有的参数；老宿主上退化为不声明
     plugin = Plugin("telegram", provides=["telegram"], **_PLUGIN_KWARGS)
 except TypeError:  # pragma: no cover - 仅老宿主走到这里
     plugin = Plugin("telegram", **_PLUGIN_KWARGS)
 
-# ── 运行时 ─────────────────────────────────────────────────────────────
+
+# ── 工具函数 ─────────────────────────────────────────────────────────
+
+
+def _resolve_endpoint(config: Config) -> tuple[str, str]:
+    """算出实际使用的 API 基址，返回 (基址, 来源)。"""
+    reverse = strip_wrapping_quotes(config.reverse_proxy_url).rstrip("/")
+    if reverse:
+        if not reverse.startswith(("http://", "https://")):
+            reverse = "https://" + reverse
+        secret = strip_wrapping_quotes(config.reverse_proxy_secret).strip("/")
+        return (f"{reverse}/{secret}" if secret else reverse), "reverse_proxy"
+    endpoint = strip_wrapping_quotes(config.endpoint).rstrip("/")
+    if endpoint and endpoint != DEFAULT_ENDPOINT.rstrip("/"):
+        if not endpoint.startswith(("http://", "https://")):
+            endpoint = "https://" + endpoint
+        return endpoint, "config"
+    return DEFAULT_ENDPOINT.rstrip("/"), "default"
+
+
+def _mask_endpoint(endpoint: str, config: Config) -> str:
+    secret = strip_wrapping_quotes(config.reverse_proxy_secret).strip("/")
+    if secret and secret in endpoint:
+        return endpoint.replace(secret, "***")
+    return endpoint
+
+
+def _source_label(source: str) -> str:
+    return {"reverse_proxy": "反代", "config": "endpoint 配置", "default": "官方默认"}.get(source, source)
+
+
+def _fill(template: str, **fields: Any) -> str:
+    """填充模板，缺字段替换成空串（不抛 KeyError）。"""
+    if not template:
+        return ""
+    out = template
+    for key, value in fields.items():
+        out = out.replace("{" + key + "}", str(value or ""))
+    return out
+
+
+def _connection_hint(config: Config, error: str = "") -> str:
+    """连接失败时给出可执行的建议。"""
+    endpoint, source = _resolve_endpoint(config)
+    raw_proxy = strip_wrapping_quotes(config.proxy)
+    lowered = (error or "").lower()
+    tips: list[str] = []
+    if raw_proxy.lower() == "auto":
+        tips.append("proxy=auto 会依次试 127.0.0.1、host.docker.internal、容器默认网关、172.17.0.1 等地址。")
+    if raw_proxy:
+        try:
+            label = parse_proxy(raw_proxy).label
+        except ProxyUnavailable:
+            label = raw_proxy
+        tips.append(f"已配置代理 {label}：确认代理进程在运行、端口正确。")
+        if raw_proxy.lower().startswith("socks"):
+            tips.append("socks5:// 由插件内置握手；失败通常是端口不提供 SOCKS5 或账号密码不对。")
+    if "getaddrinfo" in lowered:
+        tips.append(
+            "这次报的是「代理主机名解析失败」：host.docker.internal 只有 Docker Desktop 提供。"
+            "同一台机器上用 127.0.0.1；容器里用宿主地址或 proxy=\"auto\"。"
+        )
+    if source == "reverse_proxy":
+        tips.append(
+            f"已配置反代 {_mask_endpoint(endpoint, config)}：确认域名已激活、路径密钥一致，"
+            "且反代同时转发 /bot<token>/<method> 与 /file/bot<token>/...。"
+        )
+    elif source == "config":
+        tips.append(f"已配置 endpoint {endpoint}：确认宿主机能访问它。")
+    elif not raw_proxy:
+        tips.append("当前直连 api.telegram.org 且未配置代理/反代：国内网络通常无法连通。")
+    return " ".join(tips)
+
+
+# ── 运行时 ─────────────────────────────────────────────────────────
 
 
 class TelegramRuntime:
-    """插件运行时：一个实例持有 API 客户端、轮询器、绑定与计数器。"""
+    """一个实例持有 API 客户端、轮询器与计数器。"""
 
     def __init__(self, ctx: Any, config: Config) -> None:
         self.ctx = ctx
         self.config = config
         self.api: TelegramAPI | None = None
         self.poller: TelegramPoller | None = None
-        self.store = BindingStore(Path(ctx.data_dir) / "bindings.json")
         self.buffer = MediaGroupBuffer(window=1.2)
-        self.guard = LoopGuard(ttl=90.0)
         self.me: dict[str, Any] = {}
         self.bot_username = ""
-        self.chats: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self.started_at = 0.0
+        self.state = "stopped"
+        self.last_error = ""
+        self.resolved_proxy = ""
         self.counters: dict[str, int] = {
             "updates": 0,
-            "tg_to_qq": 0,
-            "qq_to_tg": 0,
-            "qq_seen": 0,
-            "qq_bot_messages": 0,
+            "messages": 0,
+            "ai_replies": 0,
+            "ai_failures": 0,
+            "ai_busy": 0,
             "dropped_bot": 0,
-            "dropped_echo": 0,
             "errors": 0,
         }
-        self.last_error = ""
-        self.state = "stopped"
-        self.resolved_proxy = ""
         self._flush_task: asyncio.Task[None] | None = None
         self._watchdog: asyncio.Task[None] | None = None
+        self._locks: dict[str, asyncio.Lock] = {}
 
-    # ── 生命周期 ──
-
-    @property
-    def poll_options(self) -> PlanOptions:
-        return PlanOptions(
-            parse_mode="html" if self.config.parse_mode == "html" else "",
-            link_preview=bool(self.config.link_preview),
-            chunk_size=int(self.config.chunk_size),
-        )
+    # ── 日志 ──
 
     def log(self, level: str, message: str, **fields: Any) -> None:
         logger = getattr(self.ctx, "logger", None)
@@ -223,26 +270,22 @@ class TelegramRuntime:
         except Exception:  # pragma: no cover - 日志失败不影响主流程
             pass
 
+    # ── 生命周期 ──
+
     async def start(self) -> None:
-        """建立客户端并开始接收更新；失败只记日志，不阻断插件加载。"""
-        self.store.load()
         if not self.config.enabled:
             self.state = "disabled"
-            self.log("info", "Telegram 桥接已禁用（配置 enabled=false）")
+            self.log("info", "Telegram 已禁用（enabled=false）")
             return
-        token = (self.config.token or "").strip()
+        token = strip_wrapping_quotes(self.config.token)
         if not token:
             self.state = "no-token"
-            self.log("warning", "Telegram 未配置 token，插件待机；在面板「插件 → 配置」填入后重载")
+            self.log("warning", "未配置 token，插件待机；在面板填入后重载")
             return
         if self.config.protocol != "polling":
-            self.log(
-                "warning",
-                "当前版本只实现 polling；已按 polling 启动（webhook 需要宿主提供入站 HTTP 端点）",
-                protocol=self.config.protocol,
-            )
+            self.log("warning", "当前版本只实现 polling；已按 polling 启动")
         endpoint, source = _resolve_endpoint(self.config)
-        proxy_value = await self._resolve_proxy_value()
+        proxy_value = await self._resolve_proxy()
         self.log(
             "info",
             "正在连接 Telegram",
@@ -262,7 +305,7 @@ class TelegramRuntime:
             self.log(
                 "info",
                 f"Telegram 已连接：@{self.bot_username or self.me.get('id')}"
-                f"（id={self.me.get('id')}，代理={self.config.proxy or '无'}）",
+                f"（id={self.me.get('id')}，AI 端点={self.ai_endpoint_label()}）",
             )
         except Exception as exc:  # noqa: BLE001 - 插件加载不能被网络问题打断
             self.state = "error"
@@ -270,40 +313,6 @@ class TelegramRuntime:
             self.log("warning", f"Telegram 连接异常：{self.last_error}")
             self.log("warning", "排查建议：" + _connection_hint(self.config, self.last_error))
             self._schedule_watchdog()
-
-    async def _resolve_proxy_value(self) -> str:
-        """``proxy = "auto"`` 时在宿主上找代理端口；其它值原样返回。"""
-        raw = (self.config.proxy or "").strip()
-        if raw.lower() != "auto":
-            self.resolved_proxy = raw
-            return raw
-        detected = await detect_proxy()
-        self.resolved_proxy = detected
-        if detected:
-            self.log("info", "proxy=auto 已探测到宿主代理", proxy=detected)
-        else:
-            self.log(
-                "warning",
-                "proxy=auto 没找到可用代理端口（试过 127.0.0.1 / host.docker.internal 的常见端口）；"
-                '改成显式地址，例如 proxy = "http://host.docker.internal:7890"',
-            )
-        return detected
-
-    def _proxy_line(self) -> str:
-        """诊断用：把 proxy 配置与实际解析结果写清楚（不泄露密码）。"""
-        raw = (self.config.proxy or "").strip()
-        if not raw:
-            return "未设置（直连）"
-        if raw.lower() == "auto":
-            return f"auto → {self.resolved_proxy or '未探测到'}"
-        gateway = getattr(self.api, "gateway_url", "") if self.api is not None else ""
-        if gateway:
-            try:
-                endpoint = parse_proxy(raw)
-            except ProxyUnavailable:
-                endpoint = None
-            return f"{endpoint.label if endpoint else raw}（内置 SOCKS5 网关：{gateway}）"
-        return raw
 
     async def _login(self) -> None:
         assert self.api is not None
@@ -326,8 +335,31 @@ class TelegramRuntime:
         self.state = "starting"
         await self.poller.start()
 
+    async def stop(self) -> None:
+        for task in (self._watchdog, self._flush_task):
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
+        self._watchdog = None
+        self._flush_task = None
+        if self.poller is not None:
+            await self.poller.stop()
+        if self.api is not None:
+            await self.api.close()
+        self.state = "stopped"
+
+    async def reconnect(self) -> str:
+        await self.stop()
+        await self.start()
+        return self.status_text()
+
+    def _on_state(self, state: str, message: str = "") -> None:
+        self.state = state
+        if message:
+            self.last_error = message
+
     def _schedule_watchdog(self) -> None:
-        """启动失败后按间隔重试，恢复后自动接上轮询（不用手动重载）。"""
         if self._watchdog is not None and not self._watchdog.done():
             return
         if self.api is None:
@@ -345,13 +377,11 @@ class TelegramRuntime:
                     self.log("debug", f"连通性复检异常：{type(exc).__name__}: {exc}")
                     continue
                 if not ok:
-                    self.log("debug", f"Telegram 仍不可达：{detail}")
                     continue
-                self.log("info", f"Telegram 恢复连通：{detail}，正在启动轮询")
+                self.log("info", f"Telegram 恢复连通：{detail}")
                 try:
                     await self._login()
                     await self._start_poller()
-                    self.log("info", f"Telegram 已连接：@{self.bot_username or self.me.get('id')}")
                 except Exception as exc:  # noqa: BLE001
                     self.state = "error"
                     self.last_error = f"{type(exc).__name__}: {exc}"
@@ -360,34 +390,22 @@ class TelegramRuntime:
 
         self._watchdog = asyncio.create_task(runner())
 
-    async def stop(self) -> None:
-        if self._watchdog is not None:
-            self._watchdog.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self._watchdog
-            self._watchdog = None
-        if self._flush_task is not None:
-            self._flush_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self._flush_task
-            self._flush_task = None
-        if self.poller is not None:
-            await self.poller.stop()
-        if self.api is not None:
-            await self.api.close()
-        self.state = "stopped"
+    # ── 代理 ──
 
-    async def reconnect(self) -> str:
-        await self.stop()
-        await self.start()
-        return self.status_text()
+    async def _resolve_proxy(self) -> str:
+        raw = strip_wrapping_quotes(self.config.proxy)
+        if raw.lower() != "auto":
+            self.resolved_proxy = raw
+            return raw
+        detected = await detect_proxy()
+        self.resolved_proxy = detected
+        if detected:
+            self.log("info", "proxy=auto 已探测到宿主代理", proxy=detected)
+        else:
+            self.log("warning", "proxy=auto 没找到可用代理端口")
+        return detected
 
-    def _on_state(self, state: str, message: str = "") -> None:
-        self.state = state
-        if message:
-            self.last_error = message
-
-    # ── 入站（Telegram → QQ） ──
+    # ── 入站 ──
 
     async def handle_updates(self, updates: list[dict[str, Any]]) -> None:
         self.counters["updates"] += len(updates)
@@ -395,22 +413,19 @@ class TelegramRuntime:
             self.log("debug", f"收到 Telegram 更新：{update_subtype(update)}")
             try:
                 event = decode_update(update, bot_username=self.bot_username)
-            except Exception as exc:  # noqa: BLE001 - 单条更新解析失败不影响后续
+            except Exception as exc:  # noqa: BLE001
                 self.counters["errors"] += 1
-                self.log("warning", f"Telegram 更新解析失败：{type(exc).__name__}: {exc}")
+                self.log("warning", f"更新解析失败：{type(exc).__name__}: {exc}")
                 continue
             if event is None:
                 continue
-            self.note_chat(event)
             if event.media_group_id:
-                # 相册：先入缓冲，等窗口到期由后台任务合并派发（不阻塞轮询）
                 self.buffer.push(event)
                 self._schedule_flush()
                 continue
             await self.dispatch(event)
 
     def _schedule_flush(self) -> None:
-        """相册窗口到期后把合并事件派发出去（不阻塞轮询循环）。"""
         if self._flush_task is not None and not self._flush_task.done():
             return
 
@@ -419,7 +434,7 @@ class TelegramRuntime:
                 await asyncio.sleep(self.buffer.window + 0.05)
                 for merged in self.buffer.flush_due():
                     await self.dispatch(merged)
-            except asyncio.CancelledError:  # pragma: no cover - 停止路径
+            except asyncio.CancelledError:  # pragma: no cover
                 raise
             except Exception as exc:  # noqa: BLE001
                 self.counters["errors"] += 1
@@ -430,128 +445,136 @@ class TelegramRuntime:
     async def dispatch(self, event: IncomingEvent) -> None:
         if event.kind == "callback_query":
             await self._answer_callback(event)
-        if event.kind in ("message", "message_updated"):
-            if event.user_is_bot and self.config.ignore_telegram_bots:
-                self.counters["dropped_bot"] += 1
-                return
-            await self.forward_to_qq(event)
-        elif event.kind in ("chat_join_request", "my_chat_member"):
-            await self.forward_notice_to_qq(event)
-        else:
-            self.log("debug", f"未桥接的 Telegram 事件类型：{event.kind}")
+            return
+        if event.kind != "message":
+            self.log("debug", f"忽略的事件类型：{event.kind}")
+            return
+        if event.user_is_bot and self.config.ignore_telegram_bots:
+            self.counters["dropped_bot"] += 1
+            return
+        self.counters["messages"] += 1
+        await self.reply_with_ai(event)
 
     async def _answer_callback(self, event: IncomingEvent) -> None:
-        """回调必须应答，否则客户端一直转圈（与 Koishi 适配器同行为）。"""
         if not (self.api and event.callback_id):
             return
-        try:
+        with contextlib.suppress(Exception):
             await self.api.answer_callback_query(event.callback_id)
-        except Exception as exc:  # noqa: BLE001
-            self.log("debug", f"answerCallbackQuery 失败：{exc}")
 
-    async def forward_to_qq(self, event: IncomingEvent) -> None:
-        for binding in self.store.by_tg(event.chat_id):
-            if not binding.tg_to_qq:
-                continue
-            text = render_tg_to_qq(event, prefix=self.config.prefix_from_tg, reply_text=event.reply_to_text)
-            payload = MessageChain().text(text)
-            self.guard.mark(text)
-            try:
-                if binding.qq_kind == "private":
-                    await self.ctx.send_private(binding.qq_id, payload, proactive=False)
-                else:
-                    await self.ctx.send_group(binding.qq_id, payload, proactive=False)
-                self.counters["tg_to_qq"] += 1
-                self.log(
-                    "info",
-                    f"Telegram → QQ：{event.chat_title or event.chat_id} → {binding.qq_kind}:{binding.qq_id}",
-                    chars=len(text),
-                )
-            except Exception as exc:  # noqa: BLE001
-                self.counters["errors"] += 1
-                self.last_error = f"{type(exc).__name__}: {exc}"
-                self.log("warning", f"投递到 QQ 失败（{binding.qq_kind}:{binding.qq_id}）：{self.last_error}")
+    # ── AI 对话 ──
 
-    async def forward_notice_to_qq(self, event: IncomingEvent) -> None:
-        notice = ""
-        if event.kind == "chat_join_request":
-            notice = f"[TG] {event.join_request_user_name or event.join_request_user_id} 申请加入 {event.chat_title or event.chat_id}"
-        elif event.kind == "my_chat_member" and event.my_chat_member_state:
-            state = {"group-added": "被拉入", "group-deleted": "被移出"}.get(event.my_chat_member_state, "成员状态变化")
-            notice = f"[TG] 机器人{state}会话 {event.chat_title or event.chat_id}"
-        if not notice:
+    def ai_endpoint_label(self) -> str:
+        if not self.config.ai_endpoint_id:
+            return "未配置"
+        kind = "群" if self.config.ai_endpoint_kind == "group" else "私聊"
+        return f"{kind} {self.config.ai_endpoint_id}"
+
+    def _orchestrator(self) -> Any | None:
+        services = getattr(self.ctx, "services", None)
+        if services is None:
+            return None
+        try:
+            return services.get("reply_orchestrator")
+        except Exception:  # noqa: BLE001 - 老宿主没有服务注册表
+            return None
+
+    def compose(self, event: IncomingEvent) -> str:
+        name = event.user_name or event.user_id or "?"
+        prefix = _fill(self.config.ai_prefix, name=name, chat=event.chat_title, id=event.user_id)
+        body = event.caption or event.text
+        if not body:
+            kinds = "、".join(sorted({item.kind for item in event.media})) or "空消息"
+            body = f"[{kinds}]"
+        return f"{prefix}{body}"
+
+    async def reply_with_ai(self, event: IncomingEvent) -> None:
+        if not self.config.ai_endpoint_id:
+            await self._safe_send(
+                event.chat_id,
+                "机器人已连上，但还没配置 AI 工作区：请在插件配置里填 ai_endpoint_kind 与 ai_endpoint_id"
+                "（一个 QQ 群号或 QQ 号）",
+                reply_to=event.message_id,
+            )
             return
-        self.guard.mark(notice)
-        for binding in self.store.by_tg(event.chat_id):
-            if not binding.tg_to_qq:
-                continue
-            try:
-                payload = MessageChain().text(notice)
-                if binding.qq_kind == "private":
-                    await self.ctx.send_private(binding.qq_id, payload, proactive=False)
-                else:
-                    await self.ctx.send_group(binding.qq_id, payload, proactive=False)
-            except Exception as exc:  # noqa: BLE001
-                self.log("warning", f"通知转发失败：{type(exc).__name__}: {exc}")
+        content = self.compose(event)
+        lock = self._locks.setdefault(str(event.chat_id), asyncio.Lock())
+        async with lock:
+            text = await self._ask_ai(content)
+        if not text:
+            self.counters["ai_failures"] += 1
+            if self.config.ai_error_reply:
+                await self._safe_send(event.chat_id, self.config.ai_error_reply, reply_to=event.message_id)
+            return
+        self.counters["ai_replies"] += 1
+        await self._safe_send(event.chat_id, text, reply_to=event.message_id)
 
-    # ── 出站（QQ → Telegram） ──
+    async def _ask_ai(self, content: str) -> str:
+        """把内容交给宿主回复管线，读回 AI 生成的文本。"""
+        orchestrator = self._orchestrator()
+        if orchestrator is None or not hasattr(orchestrator, "start_background_reply"):
+            self.log(
+                "warning",
+                "宿主没有 reply_orchestrator 服务，无法让 AI 回复；请确认 NeoBot 版本 ≥ 2.1.0",
+            )
+            return ""
+        try:
+            event = orchestrator.start_background_reply(
+                kind=self.config.ai_endpoint_kind,
+                conversation_id=str(self.config.ai_endpoint_id),
+                content=content,
+                manager_name="telegram",
+                channel=self.config.ai_channel or None,
+                proactive=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - 宿主内部异常不该打爆插件
+            self.counters["errors"] += 1
+            self.log("warning", f"启动 AI 回复失败：{type(exc).__name__}: {exc}")
+            return ""
+        if event is None:
+            self.counters["ai_busy"] += 1
+            self.log("info", "AI 工作区已有回复在进行，稍后再试")
+            return ""
 
-    async def forward_from_qq(self, event: dict[str, Any], message: Any = None) -> int:
-        """把一条 QQ 事件转发到绑定的 Telegram 会话，返回转发条数。"""
-        self.counters["qq_seen"] += 1
-        kind, conv_id = conversation_of(event)
-        if not conv_id:
-            return 0
-        bindings = self.store.by_qq(kind, conv_id)
-        if not bindings:
-            return 0
-        self_ids = self._self_ids(event)
-        user_id = str(event.get("user_id") or "")
-        is_bot_message = str(event.get("post_type") or "") == "message_sent" or (user_id and user_id in self_ids)
-        if is_bot_message:
-            self.counters["qq_bot_messages"] += 1
-            if not self.config.forward_bot_messages:
-                return 0
-        elif not self.config.forward_user_messages:
-            return 0
+        deadline = time.monotonic() + float(self.config.ai_timeout)
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.4)
+            text = str(getattr(event, "generated_text", "") or "").strip()
+            if text:
+                return text
+            state = getattr(event, "state", None)
+            if getattr(state, "name", "") in ("COMPLETED", "FAILED", "CANCELLED"):
+                break
+        text = str(getattr(event, "generated_text", "") or "").strip()
+        if not text:
+            error = getattr(event, "error", None)
+            self.log("warning", f"AI 未产出回复（{getattr(getattr(event, 'state', None), 'name', '?')}）：{error}")
+        return text
 
-        text = render_qq_to_tg(event, prefix=self.config.prefix_from_qq, strip_at=self_ids)
-        if not text.strip():
-            return 0
-        # 命令判断必须看正文：前缀（如 "[QQ 小明] 小明: "）会让整串不再以 "/" 开头
-        if not self.config.forward_commands and looks_like_command(qq_body_text(event, strip_at=self_ids)):
-            return 0
-        if self.guard.is_echo(text):
-            self.counters["dropped_echo"] += 1
-            self.log("debug", "命中回环防护，跳过转发到 Telegram")
-            return 0
-        self.guard.mark(text)
+    # ── 发送 ──
 
-        sent = 0
-        for binding in bindings:
-            if not binding.qq_to_tg:
-                continue
-            try:
-                await self.send_text(binding.tg_chat_id, text)
-                sent += 1
-                self.counters["qq_to_tg"] += 1
-            except Exception as exc:  # noqa: BLE001
-                self.counters["errors"] += 1
-                self.last_error = f"{type(exc).__name__}: {exc}"
-                self.log("warning", f"转发到 Telegram 失败（{binding.tg_chat_id}）：{self.last_error}")
-        return sent
+    def plan_options(self, *, thread_id: int = 0) -> PlanOptions:
+        return PlanOptions(
+            parse_mode="html" if self.config.parse_mode == "html" else "",
+            link_preview=bool(self.config.link_preview),
+            chunk_size=int(self.config.chunk_size),
+            thread_id=thread_id,
+        )
+
+    async def _safe_send(self, chat_id: int | str, text: str, *, reply_to: int = 0) -> None:
+        try:
+            await self.send_text(chat_id, text, reply_to=reply_to)
+        except Exception as exc:  # noqa: BLE001
+            self.counters["errors"] += 1
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            self.log("warning", f"发送到 Telegram 失败：{self.last_error}")
 
     async def send_text(self, chat_id: int | str, text: str, *, reply_to: int = 0) -> list[Any]:
-        """向 Telegram 会话发纯文本（自动分段）。"""
         if self.api is None:
             raise RuntimeError("Telegram 未连接（检查 token / 代理 / endpoint）")
         rendered = render_segments([{"type": "text", "data": {"text": text}}], reply_to_message_id=reply_to)
-        return await self._execute(build_actions(chat_id, rendered, options=self.poll_options))
+        return await self.send_actions(build_actions(chat_id, rendered, options=self.plan_options()))
 
     async def send_actions(self, actions: list[SendAction]) -> list[Any]:
-        return await self._execute(actions)
-
-    async def _execute(self, actions: list[SendAction]) -> list[Any]:
         assert self.api is not None
         results: list[Any] = []
         for action in actions:
@@ -560,106 +583,75 @@ class TelegramRuntime:
                     results.append(await self.api.call(action.method, action.params, files=action.files))
                 else:
                     results.append(await self.api.call(action.method, action.params))
-            except (TelegramError, TelegramTransportError, TelegramRetryAfter) as exc:
+            except (TelegramError, TelegramTransportError, TelegramRetryAfter):
                 self.counters["errors"] += 1
-                self.last_error = str(exc)
                 raise
         return results
 
-    # ── 辅助 ──
+    # ── 状态 / 诊断 ──
 
-    def _self_ids(self, event: dict[str, Any]) -> set[str]:
-        ids: set[str] = set()
-        for candidate in (
-            event.get("self_id"),
-            getattr(getattr(self.ctx, "adapter", None), "self_id", None),
-        ):
-            if candidate is not None and str(candidate):
-                ids.add(str(candidate))
-        return ids
-
-    def note_chat(self, event: IncomingEvent) -> None:
-        if not event.chat_id:
-            return
-        self.chats[event.chat_id] = {
-            "id": event.chat_id,
-            "type": event.chat_type,
-            "title": event.chat_title,
-            "last_seen": time.time(),
-        }
-        self.chats.move_to_end(event.chat_id)
-        while len(self.chats) > 50:
-            self.chats.popitem(last=False)
-
-    def bind_chat(self, *, tg_chat_id: str, qq_kind: str, qq_id: str, note: str = "") -> Binding:
-        known = self.chats.get(str(tg_chat_id), {})
-        binding = Binding(
-            tg_chat_id=str(tg_chat_id),
-            qq_kind=qq_kind,
-            qq_id=str(qq_id),
-            tg_title=str(known.get("title") or ""),
-            note=note,
-        )
-        self.store.add(binding)
-        self.store.save()
-        return binding
+    def _proxy_line(self) -> str:
+        raw = strip_wrapping_quotes(self.config.proxy)
+        if not raw:
+            return "未设置（直连）"
+        if raw.lower() == "auto":
+            return f"auto → {self.resolved_proxy or '未探测到'}"
+        gateway = getattr(self.api, "gateway_url", "") if self.api is not None else ""
+        if gateway:
+            try:
+                label = parse_proxy(raw).label
+            except ProxyUnavailable:
+                label = raw
+            return f"{label}（内置 SOCKS5 网关：{gateway}）"
+        return raw
 
     def status_text(self) -> str:
-        lines = ["Telegram 桥接状态"]
-        lines.append(f"· 运行状态：{self.state}")
-        lines.append(f"· 机器人：@{self.bot_username}" if self.bot_username else "· 机器人：未连接")
         endpoint, source = _resolve_endpoint(self.config)
-        lines.append(f"· 终结点：{_mask_endpoint(endpoint, self.config)}（来源：{_source_label(source)}）")
-        lines.append(f"· 代理：{self.config.proxy or '未设置'}")
-        lines.append(f"· 绑定：{len(self.store.bindings)} 条")
+        lines = [
+            "Telegram 直连 AI · 状态",
+            f"· 运行状态：{self.state}",
+            f"· 机器人：@{self.bot_username}" if self.bot_username else "· 机器人：未连接",
+            f"· 终结点：{_mask_endpoint(endpoint, self.config)}（来源：{_source_label(source)}）",
+            f"· 代理：{self._proxy_line()}",
+            f"· AI 工作区：{self.ai_endpoint_label()}",
+            "· 计数器：" + "，".join(f"{key}={value}" for key, value in self.counters.items()),
+        ]
+        if self.last_error:
+            lines.append(f"· 最近错误：{self.last_error}")
+        return "\n".join(lines)
+
+    def diag_text(self) -> str:
+        token = strip_wrapping_quotes(self.config.token)
+        masked = f"{token.split(':')[0]}:***" if ":" in token else ("未配置" if not token else "格式异常")
+        endpoint, source = _resolve_endpoint(self.config)
+        lines = [
+            "Telegram 链路诊断",
+            f"· 版本：{plugin.version}",
+            f"· token：{masked}",
+            f"· endpoint：{_mask_endpoint(endpoint, self.config)}（来源：{_source_label(source)}）",
+            f"· proxy：{self._proxy_line()}",
+            f"· protocol：{self.config.protocol}（当前实际按 polling 运行）",
+            f"· AI 工作区：{self.ai_endpoint_label()}"
+            + (f"，通道={self.config.ai_channel}" if self.config.ai_channel else "，通道=自动"),
+            f"· AI 超时：{self.config.ai_timeout}s；前缀={self.config.ai_prefix!r}",
+            f"· 宿主编排器：{'可用' if self._orchestrator() is not None else '不可用'}",
+        ]
         if self.poller is not None:
             stats = self.poller.stats
             lines.append(
                 f"· 轮询：offset={stats.offset} 收到={stats.received} 失败={stats.failures}"
                 + (f" 最近错误={stats.last_error}" if stats.last_error else "")
             )
-        if self.last_error:
-            lines.append(f"· 最近错误：{self.last_error}")
-        return "\n".join(lines)
-
-    def diag_text(self) -> str:
-        token = (self.config.token or "").strip()
-        masked = f"{token.split(':')[0]}:***" if ":" in token else ("未配置" if not token else "格式异常")
-        endpoint, source = _resolve_endpoint(self.config)
-        lines = [
-            "Telegram 链路诊断",
-            f"· 版本：{plugin.version}（min_neobot_version 2.0.0）",
-            f"· token：{masked}",
-            f"· endpoint：{_mask_endpoint(endpoint, self.config)}（来源：{_source_label(source)}）",
-            f"· proxy：{self._proxy_line()}",
-            f"· protocol：{self.config.protocol}（当前版本实际按 polling 运行）",
-            f"· allowed_updates：{len(self.config.allowed_updates) or '默认（含 chat_member）'}",
-            f"· 相册窗口：{self.buffer.window}s；回环防护 TTL：{self.guard.ttl}s",
-            "· 计数器：" + "，".join(f"{key}={value}" for key, value in self.counters.items()),
-        ]
-        if self.poller is not None:
-            stats = self.poller.stats
-            lines.append(
-                f"· 已摘除的 webhook：{len(stats.removals)}"
-                + (f"（最近：{stats.removals[-1]}）" if stats.removals else "")
-            )
-            lines.append(f"· 连续失败：{stats.consecutive_failures}；最后更新：{stats.last_update_at or '无'}")
-        if self.counters["qq_bot_messages"] == 0 and self.config.forward_bot_messages:
-            lines.append(
-                "· 提示：还没观察到 QQ 侧机器人自己的消息。AI 回复能否回传取决于协议端是否上报"
-                "（OneBot 的 post_type=message_sent / NapCat 的「上报自身消息」开关）。"
-            )
         return "\n".join(lines)
 
     async def diag_report(self) -> str:
-        """诊断 + 一次真实连通性探测（/tg诊断 用）。"""
         lines = [self.diag_text()]
         if self.state in ("no-token", "disabled"):
             lines.append("· 连通性探测：跳过（未配置 token 或已禁用）")
             return "\n".join(lines)
         if self.api is None:
             lines.append(f"· 客户端：未建立（state={self.state}）")
-            lines.append("· 建议：" + _connection_hint(self.config))
+            lines.append("· 建议：" + _connection_hint(self.config, self.last_error))
             return "\n".join(lines)
         ok, detail = await self.api.probe()
         lines.append(f"· 连通性探测：{'通' if ok else '不通'} —— {detail}")
@@ -668,89 +660,9 @@ class TelegramRuntime:
         return "\n".join(lines)
 
 
-# 插件级单例：NeoBot 的插件是「一个插件一个运行时状态」的模型，与 bili_monitor 同风格。
+# ── 插件级单例 ───────────────────────────────────────────────────────
+
 _RUNTIME: TelegramRuntime | None = None
-
-
-def _resolve_endpoint(config: Config) -> tuple[str, str]:
-    """算出实际使用的 API 基址，返回 (基址, 来源)。
-
-    优先级：``reverse_proxy_url``（+ ``reverse_proxy_secret``）> ``endpoint`` > 官方地址。
-    容错：去掉粘贴带来的引号；缺 ``http(s)://`` 时按 https 补全；反代基址与密钥做斜杠归一化。
-    """
-    reverse = strip_wrapping_quotes(config.reverse_proxy_url).rstrip("/")
-    if reverse:
-        if not reverse.startswith(("http://", "https://")):
-            reverse = "https://" + reverse
-        secret = strip_wrapping_quotes(config.reverse_proxy_secret).strip("/")
-        return (f"{reverse}/{secret}" if secret else reverse), "reverse_proxy"
-    endpoint = strip_wrapping_quotes(config.endpoint).rstrip("/")
-    if endpoint and endpoint != DEFAULT_ENDPOINT.rstrip("/"):
-        if not endpoint.startswith(("http://", "https://")):
-            endpoint = "https://" + endpoint
-        return endpoint, "config"
-    return DEFAULT_ENDPOINT.rstrip("/"), "default"
-
-
-def _mask_endpoint(endpoint: str, config: Config) -> str:
-    """把反代密钥从展示用的地址里隐去（日志、诊断都不该出现明文密钥）。"""
-    secret = (config.reverse_proxy_secret or "").strip().strip("/")
-    if secret and secret in endpoint:
-        return endpoint.replace(secret, "***")
-    return endpoint
-
-
-def _source_label(source: str) -> str:
-    return {"reverse_proxy": "反代", "config": "endpoint 配置", "default": "官方默认"}.get(source, source)
-
-
-def _connection_hint(config: Config, error: str = "") -> str:
-    """连接失败时给出可执行的排查建议（覆盖最常见的几种情况）。"""
-    endpoint, source = _resolve_endpoint(config)
-    raw_proxy = (config.proxy or "").strip()
-    lowered = (error or "").lower()
-    tips: list[str] = []
-    if raw_proxy.lower() == "auto":
-        tips.append(
-            "proxy=auto 会依次试 127.0.0.1、host.docker.internal、容器默认网关、172.17.0.1 等地址；"
-            "没探到就改成显式地址。"
-        )
-    if raw_proxy:
-        try:
-            label = parse_proxy(raw_proxy).label
-        except ProxyUnavailable:
-            label = raw_proxy
-        tips.append(f"已配置代理 {label}：确认代理进程在运行、端口正确。")
-        if raw_proxy.lower().startswith("socks"):
-            tips.append(
-                "socks5:// 由插件内置握手（不需要 socksio）：握手失败通常是端口不提供 SOCKS5，"
-                "或账号密码不对（Clash 的 mixed 端口同时支持 HTTP 与 SOCKS5）。"
-            )
-    if "getaddrinfo" in lowered:
-        tips.append(
-            "这次报的是「代理主机名解析失败」：容器里通常没有 host.docker.internal 这个别名。"
-            "把 proxy 换成宿主 IP（容器里执行 `ip route | grep default`，取 default via 后面的地址）、"
-            "或 docker 网桥网关（如 172.17.0.1），也可以直接写 proxy = \"auto\" 让插件自己试。"
-        )
-    if source == "reverse_proxy":
-        tips.append(
-            f"已配置反代 {_mask_endpoint(endpoint, config)}：确认 Worker 已部署、"
-            "路径密钥与插件填的一致；反代要同时转发 /bot<token>/<method> 与 "
-            "/file/bot<token>/...（extras/cloudflare-worker.js 已经实现）。"
-        )
-    elif source == "config":
-        tips.append(
-            f"已配置 endpoint {endpoint}：确认宿主机能访问它，且它把 "
-            "/bot<token>/<method> 与 /file/bot<token>/... 都转发到 api.telegram.org。"
-        )
-    elif not raw_proxy:
-        tips.append(
-            "当前是直连 api.telegram.org 且未配置代理或反代：国内网络通常无法连通。"
-            "可填 reverse_proxy_url（配合 extras/cloudflare-worker.js，无需本地代理），或填 proxy。"
-        )
-    elif source == "default":
-        tips.append("当前用默认 api.telegram.org + 代理：若仍不通，可改用 reverse_proxy_url 走反代。")
-    return " ".join(tips)
 
 
 def _config_of(ctx: Any) -> Config:
@@ -766,313 +678,38 @@ def _runtime(ctx: Any, config: Config | None = None) -> TelegramRuntime:
     return _RUNTIME
 
 
-# ── 命令（全部注册进宿主命令表 → /help 展示） ──────────────────────────
-
-
-def _admin_required(config: Config) -> int:
-    return 1 if config.allow_sub_admin else 2
-
-
-def _is_admin(ctx: Any, config: Config, user_id: Any) -> bool:
-    """插件 admins 名单里的用户直接放行（宿主权限由 permission 等级兜底）。"""
-    target = str(user_id)
-    return any(str(item) == target for item in config.admins)
-
-
-def _may_admin(ctx: Any, config: Config, command_context: Any, user_id: Any) -> bool:
-    """管理类命令的准入：插件 admins 名单，或宿主权限达到管理员等级。
-
-    命令统一用 ``permission=0`` 注册（沿用本工作区 group_admin 的做法），
-    权限在处理器里自查：这样才能让「不在宿主管理员列表、但被插件 admins 显式
-    授权」的号也能用，同时不放过普通成员。
-    """
-    if _is_admin(ctx, config, user_id):
-        return True
-    service = getattr(command_context, "service", None)
-    permissions = getattr(service, "permissions", None)
-    can = getattr(permissions, "can", None)
-    if not callable(can):
-        return False
-    try:
-        return bool(can(str(user_id), _admin_required(config)))
-    except Exception:  # noqa: BLE001 - 宿主权限实现变化时按拒绝处理（fail-closed）
-        return False
-
-
-def _command_context_ids(command_context: Any) -> tuple[str, str]:
-    kind = "private" if str(getattr(command_context, "kind", "group")) in ("private", "friend") else "group"
-    return kind, str(getattr(command_context, "conv_id", "") or "")
+# ── 命令（只保留状态查询） ─────────────────────────────────────────
 
 
 def register_commands(ctx: Any, config: Config) -> None:
-    """把全部快捷命令注册进 ``ctx.app_commands``，/help 列表与详情都能看到。"""
     registrar = getattr(ctx, "app_commands", None)
     if registrar is None or not getattr(registrar, "available", False):
-        ctx.logger.warning("[telegram] 宿主命令表不可用，命令未注册（/help 里不会出现本插件命令）")
+        ctx.logger.warning("[telegram] 宿主命令表不可用，命令未注册")
         return
 
-    def handler(action: str):
-        async def run(command_context: Any) -> str:
-            runtime = _runtime(ctx)
-            return await _run_command(ctx, runtime, action, command_context)
+    async def run_status(command_context: Any) -> str:
+        return _runtime(ctx).status_text()
 
-        return run
+    async def run_diag(command_context: Any) -> str:
+        return await _runtime(ctx).diag_report()
 
-    specs: tuple[dict[str, Any], ...] = (
-        {
-            "name": "tg",
-            "action": "status",
-            "description": "Telegram 桥接状态总览（别名：telegram / 电报）",
-            "usage": "[bind|unbind|list|send|chats|diag|reload]",
-            "aliases": ("telegram", "电报"),
-            "params": (
-                ("bind", "把当前 QQ 会话与 Telegram 会话绑定：/tg bind <TG会话ID>"),
-                ("unbind", "解除绑定：/tg unbind [TG会话ID]"),
-                ("list", "列出全部绑定"),
-                ("send", "向绑定的 Telegram 会话推送：/tg send <文本>"),
-                ("chats", "列出最近收到消息的 Telegram 会话与 ID"),
-                ("diag", "链路诊断（token 脱敏 / 计数 / 轮询状态）"),
-                ("reload", "重连 Telegram"),
-            ),
-            "permission": 0,
-        },
-        {
-            "name": "tg绑定",
-            "action": "bind",
-            "description": "把当前 QQ 会话与 Telegram 会话绑定（需管理员；别名：tgbind）",
-            "usage": "<TG会话ID> [group|private] [QQ号]",
-            "aliases": ("tgbind",),
-            "params": (
-                ("TG会话ID", "用 /tg chats 查看，通常是 -100 开头的群 ID 或用户 ID"),
-                ("group|private", "绑定到群还是私聊；省略按当前会话"),
-            ),
-            "permission": 0,
-        },
-        {
-            "name": "tg解绑",
-            "action": "unbind",
-            "description": "解除 Telegram 绑定（需管理员；别名：tgunbind）",
-            "usage": "[TG会话ID]",
-            "aliases": ("tgunbind",),
-            "params": (("TG会话ID", "省略时解除当前 QQ 会话的全部绑定"),),
-            "permission": 0,
-        },
-        {
-            "name": "tg列表",
-            "action": "list",
-            "description": "列出全部 Telegram 绑定（别名：tglist / 电报列表）",
-            "usage": "",
-            "aliases": ("tglist", "电报列表"),
-            "params": (),
-            "permission": 0,
-        },
-        {
-            "name": "tg推送",
-            "action": "send",
-            "description": "向绑定的 Telegram 会话推送文本（需管理员；别名：tgsend / 推送电报）",
-            "usage": "<文本>",
-            "aliases": ("tgsend", "推送电报"),
-            "params": (("文本", "要推送的内容；发给当前 QQ 会话绑定的所有 Telegram 会话"),),
-            "permission": 0,
-        },
-        {
-            "name": "tg会话",
-            "action": "chats",
-            "description": "列出最近收到消息的 Telegram 会话与 ID（别名：tgchats）",
-            "usage": "",
-            "aliases": ("tgchats",),
-            "params": (),
-            "permission": 0,
-        },
-        {
-            "name": "tg诊断",
-            "action": "diag",
-            "description": "Telegram 链路诊断：token / 代理 / 轮询 / 计数（别名：tgdiag）",
-            "usage": "",
-            "aliases": ("tgdiag", "电报诊断"),
-            "params": (),
-            "permission": 0,
-        },
-        {
-            "name": "tg重连",
-            "action": "reload",
-            "description": "重连 Telegram（需管理员；别名：tgreload）",
-            "usage": "",
-            "aliases": ("tgreload",),
-            "params": (),
-            "permission": 0,
-        },
-    )
-
-    for spec in specs:
-        registrar.register(
-            spec["name"],
-            description=spec["description"],
-            usage=spec["usage"],
-            permission=spec["permission"],
-            aliases=spec["aliases"],
-            params=spec["params"],
-        )(handler(spec["action"]))
-    names = "、".join(f"/{spec['name']}" for spec in specs)
-    ctx.logger.info(f"[telegram] 已注册命令：{names}（含别名，/help 可查）")
-
-
-def _parse_binding_args(args: str, command_context: Any) -> tuple[str, str, str]:
-    """解析 `/tg bind <TG会话ID> [group|private] [QQ号]`。"""
-    parts = [item for item in str(args or "").split() if item]
-    tg_chat_id = parts[0] if parts else ""
-    kind = ""
-    qq_id = ""
-    for item in parts[1:]:
-        lowered = item.casefold()
-        if lowered in ("group", "群"):
-            kind = "group"
-        elif lowered in ("private", "friend", "私聊"):
-            kind = "private"
-        elif item.isdigit() or item.replace("-", "").isdigit():
-            qq_id = item
-    if not kind or not qq_id:
-        fallback_kind, fallback_id = _command_context_ids(command_context)
-        kind = kind or fallback_kind
-        qq_id = qq_id or fallback_id
-    return tg_chat_id, kind, qq_id
-
-
-async def _run_command(ctx: Any, runtime: TelegramRuntime, action: str, command_context: Any) -> str:
-    config = runtime.config
-    user_id = getattr(command_context, "user_id", None)
-    if action in ("bind", "unbind", "send", "reload") and not _may_admin(
-        ctx, config, command_context, user_id
-    ):
-        return "权限不足：需要宿主管理员，或在插件配置的 admins 名单里。"
-    args = getattr(command_context, "raw_args", "") or ""
-
-    if action == "status":
-        stripped = args.strip()
-        if stripped:
-            head = stripped.split()[0].casefold()
-            mapping = {
-                "bind": "bind",
-                "绑定": "bind",
-                "unbind": "unbind",
-                "解绑": "unbind",
-                "list": "list",
-                "列表": "list",
-                "send": "send",
-                "推送": "send",
-                "chats": "chats",
-                "会话": "chats",
-                "diag": "diag",
-                "诊断": "diag",
-                "reload": "reload",
-                "重连": "reload",
-            }
-            target = mapping.get(head)
-            if target:
-                remainder = stripped[len(stripped.split()[0]) :].strip()
-                return await _run_command(ctx, runtime, target, _WithArgs(command_context, remainder))
-        return runtime.status_text()
-
-    if action == "list":
-        bindings = runtime.store.bindings
-        if not bindings:
-            return "还没有任何 Telegram 绑定。先让对方给机器人发一条消息，用 /tg会话 拿到 ID，再 /tg绑定 <ID>。"
-        lines = ["Telegram 绑定（%d 条）：" % len(bindings)]
-        for item in bindings:
-            lines.append("· " + item.describe() + (f" 备注：{item.note}" if item.note else ""))
-        return "\n".join(lines)
-
-    if action == "chats":
-        if not runtime.chats:
-            return "最近还没有收到 Telegram 消息。确认对方已给机器人发消息、且插件状态为 online。"
-        lines = ["最近的 Telegram 会话："]
-        for chat in reversed(list(runtime.chats.values())):
-            lines.append(f"· {chat.get('title') or chat.get('id')}（{chat.get('type')}，id={chat.get('id')}）")
-        return "\n".join(lines)
-
-    if action == "diag":
-        return await runtime.diag_report()
-
-    if action == "reload":
-        try:
-            return "已重连。\n" + await runtime.reconnect()
-        except Exception as exc:  # noqa: BLE001
-            return f"重连失败：{type(exc).__name__}: {exc}"
-
-    if action == "bind":
-        tg_chat_id, kind, qq_id = _parse_binding_args(args, command_context)
-        if not tg_chat_id or not qq_id:
-            return "用法：/tg绑定 <TG会话ID> [group|private] [QQ号]。先用 /tg会话 查看 TG 会话 ID。"
-        try:
-            binding = runtime.bind_chat(tg_chat_id=tg_chat_id, qq_kind=kind, qq_id=qq_id)
-        except ValueError as exc:
-            return f"绑定失败：{exc}"
-        return f"已绑定：{binding.describe()}"
-
-    if action == "unbind":
-        tg_chat_id = (args.split() or [""])[0]
-        if not tg_chat_id:
-            kind, qq_id = _command_context_ids(command_context)
-            removed = runtime.store.remove(qq_kind=kind, qq_id=qq_id)
-        else:
-            removed = runtime.store.remove(tg_chat_id=tg_chat_id)
-        if removed:
-            runtime.store.save()
-        return f"已解除 {removed} 条绑定。" if removed else "没有找到匹配的绑定。"
-
-    if action == "send":
-        text = args.strip()
-        if not text:
-            return "用法：/tg推送 <文本>"
-        kind, qq_id = _command_context_ids(command_context)
-        targets = [item for item in runtime.store.by_qq(kind, qq_id) if item.qq_to_tg or item.tg_to_qq]
-        if not targets:
-            return "当前 QQ 会话还没有绑定 Telegram 会话，先用 /tg绑定 <TG会话ID>。"
-        sent = 0
-        failed: list[str] = []
-        for binding in targets:
-            try:
-                await runtime.send_text(binding.tg_chat_id, text)
-                sent += 1
-            except Exception as exc:  # noqa: BLE001
-                failed.append(f"{binding.tg_chat_id}: {type(exc).__name__}")
-        reply = f"已推送到 {sent} 个 Telegram 会话。"
-        if failed:
-            reply += " 失败：" + "；".join(failed)
-        return reply
-
-    return runtime.status_text()
-
-
-class _WithArgs:
-    """把「子命令 + 剩余参数」包成命令上下文（复用同一套解析）。"""
-
-    def __init__(self, command_context: Any, raw_args: str) -> None:
-        self._inner = command_context
-        self.raw_args = raw_args
-
-    def __getattr__(self, item: str) -> Any:
-        return getattr(self._inner, item)
-
-
-# ── 宿主消息订阅（QQ → Telegram） ────────────────────────────────────
-
-
-@plugin.message(priority=60, block=False)
-async def bridge_qq_message(message: Any, event: dict[str, Any], ctx: Any, config: Config) -> None:
-    """QQ 侧消息 → Telegram。
-
-    只在消息属于「已绑定的 QQ 会话」时转发；机器人自己的消息按 ``forward_bot_messages``
-    决定（协议端上报 ``message_sent`` 时 AI 回复也能过桥）。
-    """
-    runtime = _runtime(ctx, config)
-    if not config.enabled or runtime.api is None:
-        return
-    try:
-        await runtime.forward_from_qq(event or {})
-    except Exception as exc:  # noqa: BLE001 - 转发失败不能影响宿主消息管线
-        runtime.counters["errors"] += 1
-        runtime.log("warning", f"QQ → Telegram 转发异常：{type(exc).__name__}: {exc}")
+    registrar.register(
+        "tg",
+        description="Telegram 直连 AI 的运行状态（别名：telegram / 电报）",
+        usage="",
+        permission=0,
+        aliases=("telegram", "电报"),
+        params=(),
+    )(run_status)
+    registrar.register(
+        "tg诊断",
+        description="Telegram 链路诊断：token / 反代 / 代理 / 轮询 / AI 工作区（别名：tgdiag）",
+        usage="",
+        permission=0,
+        aliases=("tgdiag", "电报诊断"),
+        params=(),
+    )(run_diag)
+    ctx.logger.info("[telegram] 已注册命令：/tg、/tg诊断（含别名）")
 
 
 # ── 生命周期 ─────────────────────────────────────────────────────────
@@ -1082,10 +719,10 @@ async def bridge_qq_message(message: Any, event: dict[str, Any], ctx: Any, confi
 async def on_load(ctx: Any) -> None:
     config = _config_of(ctx)
     runtime = _runtime(ctx, config)
-    runtime.store.load()
     register_commands(ctx, config)
     ctx.logger.info(
-        f"[telegram] 已加载：enabled={config.enabled} 绑定={len(runtime.store.bindings)} 条"
+        f"[telegram] 已加载：AI 工作区={runtime.ai_endpoint_label()}"
+        f"{'' if config.ai_endpoint_id else '（未配置，TG 用户会收到提示）'}"
     )
 
 
@@ -1107,19 +744,17 @@ async def on_shutdown(ctx: Any) -> None:
         with contextlib.suppress(Exception):
             await runtime.dispatch(merged)
     await runtime.stop()
-    ctx.logger.info("[telegram] 已停止（轮询与客户端已释放）")
+    ctx.logger.info("[telegram] 已停止")
     _RUNTIME = None
 
 
 def _provide_service(ctx: Any, runtime: TelegramRuntime) -> None:
-    """把发送能力作为 ``telegram`` 服务开放给其它插件（a15+ 的服务注册表）。"""
+    """把发送能力作为 telegram 服务开放给其它插件。"""
     services = getattr(ctx, "services", None)
     if services is None or not hasattr(services, "provide"):
         return
 
     class _Facade:
-        """其它插件可用的最小门面：``services.require("telegram")``。"""
-
         version = plugin.version
 
         @staticmethod
@@ -1130,23 +765,19 @@ def _provide_service(ctx: Any, runtime: TelegramRuntime) -> None:
         async def send_text(chat_id: int | str, text: str) -> None:
             await runtime.send_text(chat_id, text)
 
-        @staticmethod
-        def bindings() -> list[Binding]:
-            return runtime.store.bindings
-
     try:
-        services.provide("telegram", _Facade(), description="Telegram 桥接发送能力")
-    except Exception as exc:  # noqa: BLE001 - 老宿主没有服务注册表时忽略
+        services.provide("telegram", _Facade(), description="Telegram 直连 AI 的发送能力")
+    except Exception as exc:  # noqa: BLE001
         runtime.log("debug", f"telegram 服务注册跳过：{type(exc).__name__}: {exc}")
 
 
 __all__ = [
     "Config",
     "TelegramRuntime",
-    "bridge_qq_message",
     "on_load",
     "on_shutdown",
     "on_startup",
     "plugin",
     "register_commands",
+    "strip_wrapping_quotes",
 ]
