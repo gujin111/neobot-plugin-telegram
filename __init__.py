@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import re
 import time
 from typing import Any
 
@@ -79,6 +80,15 @@ def mask(value: object, keep: int = 3) -> str:
     return text if len(text) <= keep else text[:keep] + "***"
 
 
+#: BotFather 的 token 形状：<数字>:<35 位左右字母数字_->
+_TOKEN_SHAPE = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{30,}$")
+
+
+def token_looks_valid(token: str) -> bool:
+    """形状检查，只用来提示；Telegram 改格式时也不会阻断启动。"""
+    return bool(_TOKEN_SHAPE.match(strip_wrapping_quotes(token)))
+
+
 class Config(BaseModel):
     """插件配置；运行值在 data/plugins_data/telegram/config.toml。"""
 
@@ -133,7 +143,7 @@ class Config(BaseModel):
 
 
 _PLUGIN_KWARGS: dict[str, Any] = dict(
-    version="3.0.0",
+    version="3.0.1",
     description="Telegram 独立 Bot：只填 token 即可用（内置反代），AI 由宿主模型驱动",
     usage="发送 /tg 查看状态；/tg诊断 做一次链路探测",
     author="NeoBot 第三方插件",
@@ -174,7 +184,14 @@ def _connection_hint(config: Config, error: str = "") -> str:
     """连接失败时给一句能照做的建议。"""
     endpoint, source = _resolve_endpoint(config)
     proxy = strip_wrapping_quotes(config.proxy)
-    if "getaddrinfo" in (error or "").lower():
+    text = error or ""
+    if "404" in text or "Not Found" in text:
+        return (
+            "Telegram 回了 404 Not Found：几乎都是 token 写错——正确形状是 <数字>:<字母数字串>"
+            "（BotFather → /mybots → API Token），别填机器人用户名、api_id 或只填冒号后半段。"
+            "若响应体是小写 not found，那才是反代路径密钥不对。"
+        )
+    if "getaddrinfo" in text.lower():
         return (
             "代理主机名解析失败：容器里的 host.docker.internal 只有 Docker Desktop 提供，"
             "同机改用 127.0.0.1，或直接清空 proxy 走内置反代。"
@@ -231,6 +248,12 @@ class TelegramRuntime:
             self.state = "no-token"
             self.log("warning", "未配置 token，插件待机；在面板填入后重载")
             return
+        if not token_looks_valid(token):
+            self.log(
+                "warning",
+                f"token 形状可疑（{mask(token)}）：应为 <数字>:<字母数字串>，"
+                "不要填机器人用户名、api_id，也不要只填冒号后半段",
+            )
 
         endpoint, source = _resolve_endpoint(self.config)
         self.log(
@@ -475,6 +498,7 @@ class TelegramRuntime:
             "Telegram 链路诊断",
             f"· 版本：{plugin.version}",
             f"· token：{token.split(':')[0] + ':***' if ':' in token else mask(token)}",
+            f"· token 形状：{'正常' if token_looks_valid(token) else '可疑（应为 <数字>:<字母数字串>）'}",
             f"· endpoint：{_mask_endpoint(endpoint, self.config)}（来源：{_SOURCE_LABEL.get(source, source)}）",
             f"· 代理：{self._proxy_line()}",
             f"· proxy_key：{mask(self.config.proxy_key)}（X-Proxy-Key 请求头）",

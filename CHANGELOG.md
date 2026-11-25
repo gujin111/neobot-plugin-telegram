@@ -1,5 +1,31 @@
 # Changelog
 
+## 3.0.1
+
+把"连不上"的原因直接写进日志和诊断，不用再靠猜。
+
+### 新增
+
+- **token 形状检查**：不是 `<数字>:<字母数字串>` 时启动即警告（误填机器人用户名、api_id、
+  只填冒号后半段都会命中）；
+- **404 专用建议**：明确指向 token 写错，并区分两种情况——
+  Telegram 回的 `Not Found`（响应体 JSON）是 token 问题，
+  Worker 回的 `not found`（小写纯文本）才是反代路径密钥不对；
+- `/tg诊断` 新增一行 `· token 形状：正常 / 可疑（应为 <数字>:<字母数字串>）`。
+
+### 实测对照（边缘 IP + SNI）
+
+| 请求 | 响应 |
+| --- | --- |
+| 正确密钥 + 合法 token | `401 {"ok":false,…,"description":"Unauthorized"}` |
+| 正确密钥 + 不含冒号的 token | `404 {"ok":false,…,"description":"Not Found"}` |
+| 路径密钥错 | `404 not found`（小写纯文本） |
+| 缺 `X-Proxy-Key` | `403 forbidden` |
+
+### 验证
+
+pytest **49/49**；`devtools/simulate.py` 通过；契约导出 3.0.1。
+
 ## 3.0.0
 
 **瘦身**：删掉所有用不到的能力，代码量减半。功能不变——TG 用户照旧和 AI 对话，用户照旧只填 token。

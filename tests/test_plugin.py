@@ -230,6 +230,28 @@ def test_history_can_be_disabled(scratch):
     assert len(provider.calls[-1]) == 2
 
 
+def test_token_shape_check():
+    module = load_plugin()
+    assert module.token_looks_valid("8123456789:" + "A" * 35) is True
+    assert module.token_looks_valid('"8123456789:' + "A" * 35 + '"') is True
+    for bad in ("", "abc:def", "@my_bot", "8123456789", "telegram:token"):
+        assert module.token_looks_valid(bad) is False, bad
+
+
+def test_hint_explains_404_token_problem(scratch):
+    module, _, runtime = make_runtime({"_data_dir": str(scratch)})
+    hint = module._connection_hint(runtime.config, "getMe 失败（404）：Not Found")
+    assert "token 写错" in hint
+    assert "not found" in hint  # 也提示"小写 not found 才是密钥问题"
+
+
+def test_diag_reports_token_shape(scratch):
+    module, _, runtime = make_runtime({"_data_dir": str(scratch), "token": "8123456789:" + "A" * 35})
+    assert "token 形状：正常" in runtime.diag_text()
+    module, _, runtime = make_runtime({"_data_dir": str(scratch), "token": "abc:def"})
+    assert "token 形状：可疑" in runtime.diag_text()
+
+
 def test_missing_provider_hints_user(scratch):
     module, ctx, runtime = make_runtime({"_data_dir": str(scratch)})
     asyncio.run(runtime.reply_with_ai(tg_event()))
