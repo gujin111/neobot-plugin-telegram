@@ -148,6 +148,30 @@ class FakePromptStore:
         return self.sections.get(name, default)
 
 
+class FakeReplyEvent:
+    """冒充宿主的 ReplyEvent：只需要 generated_text / state / error。"""
+
+    def __init__(self, text: str = "", state: str = "COMPLETED", error=None) -> None:
+        self.generated_text = text
+        self.state = SimpleNamespace(name=state)
+        self.error = error
+
+
+class FakeOrchestrator:
+    """冒充宿主的 reply_orchestrator 服务。"""
+
+    def __init__(self, events=None, *, busy: bool = False) -> None:
+        self.events = list(events if events is not None else [FakeReplyEvent("来自宿主管线")])
+        self.busy = busy
+        self.calls: list[dict] = []
+
+    def start_background_reply(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.busy:
+            return None
+        return self.events.pop(0) if self.events else None
+
+
 def make_runtime(config: dict, *, provider=None, services: dict | None = None, host_services: dict | None = None):
     module = load_plugin()
     provided = dict(services or {})
@@ -435,6 +459,98 @@ def test_diag_reports_prompt_source(scratch):
     text = runtime.diag_text()
     assert "提示词：host" in text
     assert "宿主人格" in text and "小九" in text
+
+
+# ── agent 模式：走宿主完整管线（工具/技能/记忆） ────────────────────
+
+
+def agent_config(**overrides) -> dict:
+    config = {
+        "reply_mode": "agent",
+        "agent_endpoint_kind": "group",
+        "agent_endpoint_id": "12345",
+        "agent_prefix": "[TG {name}] ",
+        "agent_queue_wait": 0,
+        "agent_timeout": 30,
+    }
+    config.update(overrides)
+    return config
+
+
+def test_agent_mode_forwards_host_pipeline_text(scratch):
+    orchestrator = FakeOrchestrator()
+    module, ctx, runtime = make_runtime(
+        {"_data_dir": str(scratch), **agent_config()}, provider=FakeProvider(), host_services={"reply_orchestrator": orchestrator}
+    )
+    assert runtime.agent_ready() is True
+    asyncio.run(runtime.reply(tg_event(text="帮我查下天气")))
+    call = orchestrator.calls[0]
+    assert call["kind"] == "group"
+    assert call["conversation_id"] == "12345"
+    assert call["content"] == "[TG 小明] 帮我查下天气"
+    assert call["manager_name"] == "telegram"
+    assert call["proactive"] is True
+    assert runtime.api.last_text() == "来自宿主管线"
+    assert runtime.counters["replies"] == 1
+
+
+def test_agent_mode_requires_endpoint_else_chat(scratch):
+    orchestrator = FakeOrchestrator()
+    provider = FakeProvider("走的是 chat 模式")
+    module, ctx, runtime = make_runtime(
+        {"_data_dir": str(scratch), **agent_config(agent_endpoint_id="")},
+        provider=provider,
+        host_services={"reply_orchestrator": orchestrator},
+    )
+    assert runtime.agent_ready() is False
+    assert "已回退 chat" in runtime.agent_label()
+    asyncio.run(runtime.reply(tg_event()))
+    assert orchestrator.calls == []
+    assert runtime.api.last_text() == "走的是 chat 模式"
+
+
+def test_agent_mode_busy_uses_busy_reply(scratch):
+    orchestrator = FakeOrchestrator(busy=True)
+    module, ctx, runtime = make_runtime(
+        {"_data_dir": str(scratch), **agent_config(agent_busy_reply="（排队失败）")},
+        host_services={"reply_orchestrator": orchestrator},
+    )
+    asyncio.run(runtime.reply(tg_event()))
+    assert runtime.api.last_text() == "（排队失败）"
+    assert runtime.counters["busy"] == 1
+    assert runtime.counters["failures"] == 1
+
+
+def test_agent_mode_empty_generation_logs(scratch):
+    orchestrator = FakeOrchestrator([FakeReplyEvent("", state="FAILED", error="tool boom")])
+    module, ctx, runtime = make_runtime(
+        {"_data_dir": str(scratch), **agent_config(agent_busy_reply="（没产出）")},
+        host_services={"reply_orchestrator": orchestrator},
+    )
+    asyncio.run(runtime.reply(tg_event()))
+    assert runtime.api.last_text() == "（没产出）"
+    assert "没有产出文本" in ctx.logger.text()
+
+
+def test_dispatch_routes_through_reply_router(scratch):
+    orchestrator = FakeOrchestrator([FakeReplyEvent("管线回复")])
+    module, ctx, runtime = make_runtime(
+        {"_data_dir": str(scratch), **agent_config()}, host_services={"reply_orchestrator": orchestrator}
+    )
+    asyncio.run(runtime.dispatch(tg_event(text="在吗")))
+    assert len(orchestrator.calls) == 1
+    assert runtime.api.last_text() == "管线回复"
+
+
+def test_diag_reports_agent_mode(scratch):
+    orchestrator = FakeOrchestrator()
+    module, ctx, runtime = make_runtime(
+        {"_data_dir": str(scratch), "token": "1:a", **agent_config()},
+        host_services={"reply_orchestrator": orchestrator},
+    )
+    text = runtime.diag_text()
+    assert "回复模式：agent（工作区=群 12345）" in text
+    assert "提示词：agent 模式" in text
 
 
 # ── 入站分发 ───────────────────────────────────────────────────────

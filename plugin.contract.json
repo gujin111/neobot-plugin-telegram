@@ -4,6 +4,54 @@
     "additionalProperties": true,
     "description": "插件配置；运行值在 data/plugins_data/telegram/config.toml。",
     "properties": {
+      "agent_busy_reply": {
+        "default": "（机器人还在处理上一条消息，稍后再试）",
+        "description": "工作区忙或超时时的兜底文案；留空则不回复",
+        "title": "Agent Busy Reply",
+        "type": "string"
+      },
+      "agent_channel": {
+        "default": "",
+        "description": "工作区所在通道：onebot / official；留空让宿主判断",
+        "title": "Agent Channel",
+        "type": "string"
+      },
+      "agent_endpoint_id": {
+        "default": "",
+        "description": "工作区 ID：QQ 群号（group）或 QQ 号（private）——填了才启用 agent 模式",
+        "title": "Agent Endpoint Id",
+        "type": "string"
+      },
+      "agent_endpoint_kind": {
+        "default": "group",
+        "description": "工作区类型：把 TG 消息投递到哪个 QQ 会话（群/私聊）",
+        "enum": [
+          "group",
+          "private"
+        ],
+        "title": "Agent Endpoint Kind",
+        "type": "string"
+      },
+      "agent_prefix": {
+        "default": "[TG {name}] ",
+        "description": "投递给宿主时加的前缀，让模型知道是谁在说话；支持 {name} {chat} {id}",
+        "title": "Agent Prefix",
+        "type": "string"
+      },
+      "agent_queue_wait": {
+        "default": 30.0,
+        "description": "工作区正忙时最多排队等待多少秒（0 = 不等，直接回 busy 文案）",
+        "minimum": 0.0,
+        "title": "Agent Queue Wait",
+        "type": "number"
+      },
+      "agent_timeout": {
+        "default": 300.0,
+        "description": "等待宿主整轮（含工具调用）完成的超时（秒）",
+        "minimum": 10.0,
+        "title": "Agent Timeout",
+        "type": "number"
+      },
       "ai_error_reply": {
         "default": "（AI 暂时没有响应，请稍后再试）",
         "description": "模型失败时回给用户的文案；留空则不回复",
@@ -81,6 +129,16 @@
         "title": "Proxy Key",
         "type": "string"
       },
+      "reply_mode": {
+        "default": "chat",
+        "description": "chat = 插件直接问模型（只有人格，没有工具/记忆）；agent = 交给宿主回复管线（工具/技能/记忆/Agent 全生效，需要一个 QQ 工作区会话）",
+        "enum": [
+          "chat",
+          "agent"
+        ],
+        "title": "Reply Mode",
+        "type": "string"
+      },
       "retry_interval": {
         "default": 5.0,
         "description": "失败重试间隔（秒）",
@@ -127,7 +185,7 @@
   "plugin": {
     "description": "Telegram 独立 Bot：只填 token 即可用（内置反代），AI 由宿主模型驱动",
     "name": "telegram",
-    "version": "3.1.2"
+    "version": "3.2.0"
   },
   "resources": [],
   "schema_version": 1

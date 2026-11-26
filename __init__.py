@@ -82,6 +82,14 @@ def strip_wrapping_quotes(value: object) -> str:
     return text
 
 
+def _fill(template: str, **fields: Any) -> str:
+    """填模板里的 {name}/{chat}/{id}，缺字段当空串。"""
+    out = template or ""
+    for key, value in fields.items():
+        out = out.replace("{" + key + "}", str(value or ""))
+    return out
+
+
 def mask(value: object, keep: int = 3) -> str:
     """给日志/诊断用的打码：保留前缀，其余星号。"""
     text = strip_wrapping_quotes(value)
@@ -142,6 +150,11 @@ class Config(BaseModel):
     ignore_telegram_bots: bool = Field(default=True, description="忽略其它机器人发的消息")
 
     # AI
+    reply_mode: Literal["chat", "agent"] = Field(
+        default="chat",
+        description="chat = 插件直接问模型（只有人格，没有工具/记忆）；"
+        "agent = 交给宿主回复管线（工具/技能/记忆/Agent 全生效，需要一个 QQ 工作区会话）",
+    )
     prompt_source: Literal["host", "custom"] = Field(
         default="host",
         description="host = 沿用 NeoBot 的昵称与人格（面板里写的），并追加下面的补充提示词；"
@@ -161,9 +174,28 @@ class Config(BaseModel):
         default="（AI 暂时没有响应，请稍后再试）", description="模型失败时回给用户的文案；留空则不回复"
     )
 
+    # agent 模式（走宿主管线，工具/技能/记忆全生效）
+    agent_endpoint_kind: Literal["group", "private"] = Field(
+        default="group", description="工作区类型：把 TG 消息投递到哪个 QQ 会话（群/私聊）"
+    )
+    agent_endpoint_id: str = Field(
+        default="", description="工作区 ID：QQ 群号（group）或 QQ 号（private）——填了才启用 agent 模式"
+    )
+    agent_channel: str = Field(default="", description="工作区所在通道：onebot / official；留空让宿主判断")
+    agent_prefix: str = Field(
+        default="[TG {name}] ", description="投递给宿主时加的前缀，让模型知道是谁在说话；支持 {name} {chat} {id}"
+    )
+    agent_timeout: float = Field(default=300.0, ge=10.0, description="等待宿主整轮（含工具调用）完成的超时（秒）")
+    agent_queue_wait: float = Field(
+        default=30.0, ge=0.0, description="工作区正忙时最多排队等待多少秒（0 = 不等，直接回 busy 文案）"
+    )
+    agent_busy_reply: str = Field(
+        default="（机器人还在处理上一条消息，稍后再试）", description="工作区忙或超时时的兜底文案；留空则不回复"
+    )
+
 
 _PLUGIN_KWARGS: dict[str, Any] = dict(
-    version="3.1.2",
+    version="3.2.0",
     description="Telegram 独立 Bot：只填 token 即可用（内置反代），AI 由宿主模型驱动",
     usage="发送 /tg 查看状态；/tg诊断 做一次链路探测",
     author="NeoBot 第三方插件",
@@ -242,7 +274,14 @@ class TelegramRuntime:
         self.state = "stopped"
         self.last_error = ""
         self.started_at = 0.0
-        self.counters: dict[str, int] = {"updates": 0, "messages": 0, "replies": 0, "failures": 0, "errors": 0}
+        self.counters: dict[str, int] = {
+            "updates": 0,
+            "messages": 0,
+            "replies": 0,
+            "failures": 0,
+            "busy": 0,
+            "errors": 0,
+        }
         self._history: dict[str, list[dict[str, Any]]] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._retry_task: asyncio.Task[None] | None = None
@@ -383,7 +422,14 @@ class TelegramRuntime:
         if event.user_is_bot and self.config.ignore_telegram_bots:
             return
         self.counters["messages"] += 1
-        await self.reply_with_ai(event)
+        await self.reply(event)
+
+    async def reply(self, event: IncomingEvent) -> None:
+        """按配置选择：走宿主完整管线（工具/技能/记忆），还是插件直接问模型。"""
+        if self.config.reply_mode == "agent" and self.agent_ready():
+            await self.reply_via_agent(event)
+        else:
+            await self.reply_with_ai(event)
 
     # ── AI 对话 ──
 
@@ -503,6 +549,90 @@ class TelegramRuntime:
     def history_for(self, chat_id: str) -> list[dict[str, Any]]:
         return self._history.setdefault(str(chat_id), [])
 
+    # ── agent 模式：走宿主回复管线（工具 / 技能 / 记忆 / Agent 全生效） ──
+
+    def _orchestrator(self) -> Any | None:
+        return self._service("reply_orchestrator")
+
+    def agent_ready(self) -> bool:
+        orchestrator = self._orchestrator()
+        return bool(self.config.agent_endpoint_id) and orchestrator is not None and hasattr(
+            orchestrator, "start_background_reply"
+        )
+
+    def agent_label(self) -> str:
+        if self.config.reply_mode != "agent":
+            return "chat（插件直接问模型）"
+        if not self.config.agent_endpoint_id:
+            return "agent（未填 agent_endpoint_id，已回退 chat）"
+        kind = "群" if self.config.agent_endpoint_kind == "group" else "私聊"
+        return f"agent（工作区={kind} {self.config.agent_endpoint_id}）"
+
+    async def reply_via_agent(self, event: IncomingEvent) -> None:
+        """把消息投进宿主管线，读回 AI 生成的文本再转发到 TG。"""
+        orchestrator = self._orchestrator()
+        body = event.body
+        if orchestrator is None or not body:
+            await self.reply_with_ai(event)
+            return
+        content = _fill(
+            self.config.agent_prefix, name=event.user_name, chat=event.chat_title, id=event.user_id
+        ) + body
+        lock = self._locks.setdefault(str(event.chat_id), asyncio.Lock())
+        async with lock:
+            reply_event = await self._start_agent_reply(orchestrator, content)
+            text = await self._await_agent_text(reply_event) if reply_event is not None else ""
+        if not text:
+            self.counters["failures"] += 1
+            if self.config.agent_busy_reply:
+                await self._safe_send(event.chat_id, self.config.agent_busy_reply, reply_to=event.message_id)
+            return
+        self.counters["replies"] += 1
+        await self._safe_send(event.chat_id, text, reply_to=event.message_id)
+
+    async def _start_agent_reply(self, orchestrator: Any, content: str) -> Any | None:
+        """启动宿主管线；工作区正忙时排队等待（宿主同一会话同时只跑一条管线）。"""
+        deadline = time.monotonic() + float(self.config.agent_queue_wait)
+        while True:
+            try:
+                reply_event = orchestrator.start_background_reply(
+                    kind=self.config.agent_endpoint_kind,
+                    conversation_id=str(self.config.agent_endpoint_id),
+                    content=content,
+                    manager_name="telegram",
+                    channel=self.config.agent_channel or None,
+                    proactive=True,
+                )
+            except Exception as exc:  # noqa: BLE001 - 宿主内部异常不该打爆插件
+                self.counters["errors"] += 1
+                self.log("warning", f"启动宿主回复管线失败：{type(exc).__name__}: {exc}")
+                return None
+            if reply_event is not None:
+                return reply_event
+            if time.monotonic() >= deadline:
+                self.counters["busy"] = self.counters.get("busy", 0) + 1
+                self.log("info", "工作区已有回复在跑，等待超时")
+                return None
+            await asyncio.sleep(1.0)
+
+    async def _await_agent_text(self, reply_event: Any) -> str:
+        """等宿主整轮结束（可能含工具调用），取 generated_text。"""
+        deadline = time.monotonic() + float(self.config.agent_timeout)
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.4)
+            text = str(getattr(reply_event, "generated_text", "") or "").strip()
+            if text:
+                return text
+            state = getattr(getattr(reply_event, "state", None), "name", "")
+            if state in ("COMPLETED", "FAILED", "CANCELLED"):
+                break
+        text = str(getattr(reply_event, "generated_text", "") or "").strip()
+        if not text:
+            error = getattr(reply_event, "error", None)
+            state = getattr(getattr(reply_event, "state", None), "name", "?")
+            self.log("warning", f"宿主管线没有产出文本（state={state}）：{error}")
+        return text
+
     async def reply_with_ai(self, event: IncomingEvent) -> None:
         if self.provider is None:
             self.counters["failures"] += 1
@@ -601,6 +731,8 @@ class TelegramRuntime:
 
     def _prompt_summary(self) -> str:
         nick, persona = self.host_persona()
+        if self.config.reply_mode == "agent":
+            return "agent 模式：提示词/技能/记忆都由宿主自己装配"
         if self.config.prompt_source == "custom":
             return f"custom（只用 system_prompt，{len(self.config.system_prompt)} 字）"
         detail = f"宿主人格 {len(persona)} 字"
@@ -639,6 +771,7 @@ class TelegramRuntime:
             f"· 代理：{self._proxy_line()}",
             f"· proxy_key：{mask(self.config.proxy_key)}（X-Proxy-Key 请求头）",
             f"· 模型服务：{self.provider_label()}；超时={self.config.ai_timeout}s",
+            f"· 回复模式：{self.agent_label()}",
             f"· 提示词：{self._prompt_summary()}",
         ]
         if self.poller is not None:

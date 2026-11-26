@@ -1,5 +1,5 @@
 name = "telegram"
-version = "3.1.2"
+version = "3.2.0"
 description = "Telegram 独立 Bot：只填 token 即可用（内置反代），AI 由宿主模型驱动"
 author = "NeoBot 第三方插件"
 license = "MIT"
@@ -45,6 +45,10 @@ retry_interval = 5.0
 ignore_telegram_bots = true
 
 # ── AI：直接用宿主的主模型服务（Provider）与宿主已写好的人格/提示词 ──
+# 回复模式：
+#   chat  = 插件直接问模型（只有人格与上下文，没有工具/技能/记忆）
+#   agent = 交给宿主回复管线（工具/技能/记忆/Agent 全生效，需要一个 QQ 工作区会话）
+reply_mode = "chat"
 # host = 沿用 NeoBot 面板里的昵称与人格（bot_data），并追加下面的补充提示词
 # custom = 只用下面的 system_prompt
 prompt_source = "host"
@@ -58,6 +62,22 @@ history_limit = 12
 ai_timeout = 120.0
 # 模型失败时回给用户的文案；留空则不回复
 ai_error_reply = "（AI 暂时没有响应，请稍后再试）"
+
+# ── agent 模式专用（reply_mode = "agent"）──
+# 工作区类型：group（群聊）/ private（私聊）
+agent_endpoint_kind = "group"
+# 工作区 ID：QQ 群号或 QQ 号；填了才启用 agent 模式
+agent_endpoint_id = ""
+# 工作区所在通道：onebot / official；留空让宿主判断
+agent_channel = ""
+# 投递给宿主时加的前缀，让模型知道是谁在说话；支持 {name} {chat} {id}
+agent_prefix = "[TG {name}] "
+# 等待宿主整轮（含工具调用）完成的超时（秒）
+agent_timeout = 300.0
+# 工作区正忙时最多排队等待多少秒（0 = 不等）
+agent_queue_wait = 30.0
+# 忙/超时时的兜底文案；留空则不回复
+agent_busy_reply = "（机器人还在处理上一条消息，稍后再试）"
 
 [sdk]
 version = 1

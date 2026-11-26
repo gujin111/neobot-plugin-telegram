@@ -1,5 +1,43 @@
 # Changelog
 
+## 3.2.0
+
+新增 **agent 模式**：让 TG 也用上宿主的工具、技能、记忆 —— 作为可选模式，默认仍是纯 TG 的 chat 模式。
+
+### 为什么需要"工作区"
+
+宿主的工具、技能、记忆、Agent 全都长在**回复管线**里，而那条管线是按「QQ 会话」
+（`kind` + `conversation_id`）组织的。插件唯一的程序化入口是宿主公开的：
+
+```python
+orchestrator.start_background_reply(kind=..., conversation_id=..., content=..., channel=..., proactive=True)
+```
+
+它返回 `ReplyEvent`，AI 生成的原文在 `event.generated_text` 里（`generate.py:208` 写入），
+插件读出来再转发到 TG。所以 agent 模式需要一个 QQ 群或私聊当工作区。
+
+### 新增
+
+- `reply_mode = "chat" | "agent"`（默认 `chat`，行为不变）；
+- `agent_endpoint_kind` / `agent_endpoint_id` / `agent_channel` / `agent_prefix` /
+  `agent_timeout` / `agent_queue_wait` / `agent_busy_reply`；
+- 工作区忙时按 `agent_queue_wait` 排队重试（宿主同一会话同时只跑一条管线，返回 None）；
+- 计数器新增 `busy`；`/tg诊断` 新增 `· 回复模式：agent（工作区=群 12345）`，
+  agent 模式下提示词一栏显示"由宿主自己装配"。
+
+### 代价（务必知情）
+
+1. AI 的回复**也会发到那个 QQ 工作区**——出站由宿主掌控，插件拦不住；
+2. 所有 TG 用户**共享同一个工作区**，因此上下文与记忆是共享的；
+3. 同一时刻只有一条管线，TG 消息之间会排队（超过 `agent_queue_wait` 则回 busy 文案）。
+
+要做到"TG 与 QQ 完全对等且不碰 QQ"，需要宿主层面支持 Telegram 适配器（改 NeoBot 本体）。
+
+### 验证
+
+pytest **64/64**（新增：agent 模式透传内容/前缀/kind/id、未配置时回退 chat、忙与空产出的兜底、
+dispatch 走路由、诊断显示模式）；`devtools/simulate.py` 通过；契约导出 3.2.0。
+
 ## 3.1.2
 
 按宿主文档补上服务读取入口，并让诊断说清"到底看到了什么"。
